@@ -1,3 +1,4 @@
+from types import NoneType
 
 # AI 개인비서 '에이블' (Streamlit)
 # 실행: streamlit run app.py
@@ -9,7 +10,7 @@
 #   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
-#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 할 일 / 최근 회의록 요약 / 최근 받은 메일 5개 요약
+#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
 #   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
 #              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
 import os
@@ -511,33 +512,6 @@ def fmt_date(d):
     return f"{d.month}/{d.day}({WEEKDAYS[d.weekday()]})"
 
 
-def date_table():
-    # '이번 주 목요일' 같은 표현을 LLM이 직접 계산하지 않고 표에서 찾아 쓰도록, 오늘 기준 날짜표를 매번 새로 만듦
-    # (today가 실행할 때마다 바뀌므로 내년·연말에도 그 주에 맞는 날짜가 자동으로 들어감)
-    monday = today - dt.timedelta(days=today.weekday())
-    near = [f"{label} {(today + dt.timedelta(days=i)).isoformat()}({WEEKDAYS[(today + dt.timedelta(days=i)).weekday()]})"
-            for i, label in enumerate(["오늘", "내일", "모레", "글피"])]
-    lines = ["[날짜표] 한 주는 월요일~일요일입니다. 날짜는 직접 계산하지 말고 반드시 이 표에서 골라 씁니다.",
-             "- " + ", ".join(near)]
-    for w, label in enumerate(["지난 주", "이번 주", "다음 주", "다다음 주"], start=-1):
-        days = [monday + dt.timedelta(days=7 * w + i) for i in range(7)]
-        lines.append(f"- {label}: " + ", ".join(f"{WEEKDAYS[d.weekday()]} {d.isoformat()}" for d in days))
-    lines += ["- '이번 주/다음 주' 없이 요일만 말하면(예: '목요일에') 오늘 이후(오늘 포함) 가장 가까운 그 요일입니다.",
-              "- 시간에 오전/오후가 없을 때: 1~7시는 오후(13:00~19:00), 8~11시는 오전, 12시는 12:00으로 봅니다.",
-              "  '오전', '새벽', '아침'이라고 말했을 때만 1~7시를 오전으로 씁니다."]
-    return "\n".join(lines)
-
-
-def check_weekday(date_iso, weekday):
-    # 김 대리가 말한 요일과 도구에 넘어온 날짜의 요일이 다르면 등록하지 않고 다시 계산하게 함
-    d = parse_date(date_iso)
-    if not weekday or d is None or WEEKDAYS[d.weekday()] == weekday:
-        return None
-    return {"status": "failed", "retry": True,
-            "error": f"{date_iso}는 {WEEKDAYS[d.weekday()]}요일인데 요청한 요일은 {weekday}요일입니다. "
-                     "등록하지 않았습니다. [날짜표]에서 날짜를 다시 찾아 도구를 다시 호출하세요."}
-
-
 # 예전 버전에서 저장한 일정·할 일·연락처·대화도 새 형식으로 읽기 (시간 없는 일정은 종일 일정으로 그대로 유지)
 for _e in data["events"]:
     _e.setdefault("note", "")
@@ -731,7 +705,7 @@ TASK_RULES = [
     "- evidence에는 그 업무가 김 대리에게 맡겨졌다는 근거 문장을 원문에서 글자 그대로 한 문장 복사합니다.",
     "- due_type: 날짜나 요일이 구체적이면 exact(예: 11월 14일까지, 이번 주 금요일까지),",
     "  '다음 주까지', '다음 달 초', '빨리', '출시 2주 전'처럼 대략적이면 approximate, 기한 언급이 없으면 none.",
-    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 [날짜표]에서 찾아 YYYY-MM-DD로 씁니다.",
+    "- due_text는 원문 표현 그대로, due_date는 exact일 때만 오늘 기준 YYYY-MM-DD로 바꿔 씁니다.",
     "- priority: 원문에 '중요', '꼭', '빨리', '급하게' 같은 표현이 있으면 높음, 없으면 보통.",
 ]
 
@@ -1273,10 +1247,20 @@ def _toggle_from_dialog(todo_id):
     done = st.session_state[f"dlg_chk_{todo_id}"]
     set_todo_done(todo_id, done)
     st.session_state[f"chk_{todo_id}"] = done  # 대시보드 목록의 체크박스도 같이 맞춤
+    st.session_state.dlg_dirty = True           # 콜백 안에서는 rerun이 안 되므로 표시만 해 둠
+
+
+def _refresh_day(d):
+    # 팝업(fragment) 안에서 데이터가 바뀌면 앱 전체를 다시 실행해 사이드바·상단 칩·캘린더까지 반영하고,
+    # 같은 날짜 팝업을 다시 열어 팝업이 닫히지 않은 것처럼 보이게 함
+    st.session_state.dlg_reopen = d.isoformat()
+    st.rerun()
 
 
 @st.dialog("하루 일정", width="large")
 def day_dialog(d):
+    if st.session_state.pop("dlg_dirty", False):     # 팝업 안 체크박스로 완료 처리한 경우
+        _refresh_day(d)
     iso = d.isoformat()
     st.markdown(f"### {d.year}년 {d.month}월 {d.day}일 ({WEEKDAYS[d.weekday()]}) · {d_day(d)}")
 
@@ -1293,7 +1277,7 @@ def day_dialog(d):
                     st.session_state.dlg_edit = None
                     if r["status"] == "needs_approval":
                         st.rerun()             # 충돌 → 창을 닫고 화면 위에서 시간 선택
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
                 if st.button("취소", key=f"dlg_edit_cancel_{e['id']}"):
                     st.session_state.dlg_edit = None
                     st.rerun(scope="fragment")
@@ -1308,7 +1292,7 @@ def day_dialog(d):
                     st.rerun(scope="fragment")
                 if dl:
                     delete_item("events", e["id"])
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
 
     todos = [t for t in data["todos"] if t["due"] == iso]
     st.markdown(f"#### 이 날 마감인 할 일 ({len(todos)}건)")
@@ -1321,7 +1305,7 @@ def day_dialog(d):
                 if f:
                     update_todo(t["id"], **f)
                     st.session_state.dlg_edit_td = None
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
                 if st.button("취소", key=f"dlg_td_cancel_{t['id']}"):
                     st.session_state.dlg_edit_td = None
                     st.rerun(scope="fragment")
@@ -1338,7 +1322,7 @@ def day_dialog(d):
                     st.rerun(scope="fragment")
                 if dl:
                     delete_item("todos", t["id"])
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
 
     st.markdown("#### 이 날에 추가")
     kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True, key=f"dlg_kind_{iso}",
@@ -1349,15 +1333,15 @@ def day_dialog(d):
             r = add_event(f["title"], f["date"], f["note"], "직접 입력", f["start"], f["end"], f["category"])
             if r["status"] == "needs_approval":
                 st.rerun()
-            st.rerun(scope="fragment")
+            _refresh_day(d)
     else:
         f = todo_form(f"dlg_add_td_{iso}", default_due=d)
         if f:
             add_todo(f["title"], f["due"], f["priority"], f["detail"], "직접 입력", f["category"])
-            st.rerun(scope="fragment")
+            _refresh_day(d)
 
     st.divider()
-    if st.button("닫고 캘린더에 반영", type="primary", use_container_width=True):
+    if st.button("닫기", type="primary", use_container_width=True):
         st.rerun()
 
 
@@ -1370,16 +1354,18 @@ def render_calendar(year, month):
         color = "#e5484d" if i == 0 else "#3e7bfa" if i == 6 else "inherit"
         head[i].markdown(f'<div class="cal-head" style="color:{color}">{w}</div>', unsafe_allow_html=True)
 
+    reopen = st.session_state.pop("dlg_reopen", None)     # 팝업에서 바꾼 뒤 같은 날짜 팝업 다시 열기
     with st.container(key="able_cal"):
         for week in weeks:
             cols = st.columns(7)
             for i, d in enumerate(week):
                 with cols[i]:
                     items = m.get(d, [])
-                    if st.button(str(d.day), key=f"day_{d.isoformat()}",
-                                 type="primary" if d == today else "secondary",
-                                 use_container_width=True,
-                                 help=f"{d.month}월 {d.day}일 일정 보기·추가·수정·삭제"):
+                    clicked = st.button(str(d.day), key=f"day_{d.isoformat()}",
+                                        type="primary" if d == today else "secondary",
+                                        use_container_width=True,
+                                        help=f"{d.month}월 {d.day}일 일정 보기·추가·수정·삭제")
+                    if clicked or reopen == d.isoformat():
                         day_dialog(d)
                     pills = "".join(pill_html(k, lb, c) for _, k, lb, c in items[:2])
                     if len(items) > 2:
@@ -1647,17 +1633,14 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string", "description": "일정 제목"},
                 "date": {"type": "string", "description": "날짜 YYYY-MM-DD"},
-                "start": {"type": "string",
-                          "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열. 오전/오후 없는 1~7시는 오후(예: 2시 → 14:00)"},
+                "start": {"type": "string", "description": "시작 시간 HH:MM (24시간), 종일 일정이면 빈 문자열"},
                 "end": {"type": "string",
                         "description": "끝나는 시간 HH:MM. 말하지 않았으면 빈 문자열 → 종류별 자동 "
                                        f"({type_guide()})"},
                 "category": {"type": "string", "enum": EVENT_CATS, "description": "일정 종류"},
                 "note": {"type": "string", "description": "메모, 없으면 빈 문자열"},
-                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
-                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["title", "date", "start", "end", "category", "note", "weekday"], "additionalProperties": False,
+            "required": ["title", "date", "start", "end", "category", "note"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1672,10 +1655,8 @@ TOOLS = [
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "start": {"type": "string", "description": "HH:MM, 종일이면 빈 문자열"},
                 "end": {"type": "string", "description": "HH:MM, 모르면 빈 문자열(원래 길이 유지)"},
-                "weekday": {"type": "string", "enum": ["", "월", "화", "수", "목", "금", "토", "일"],
-                            "description": "김 대리가 요일을 말했으면 그 요일(예: 목), 날짜로만 말했으면 빈 문자열"},
             },
-            "required": ["id", "date", "start", "end", "weekday"], "additionalProperties": False,
+            "required": ["id", "date", "start", "end"], "additionalProperties": False,
         },
         "strict": True,
     },
@@ -1750,10 +1731,6 @@ def recent_mails_for_chat(count=5):
 def run_tool(name, args):
     if name == "add_todo":
         return add_todo(args["title"], args["due"], args["priority"], args["detail"], "에이블", args["category"])
-    if name in ("add_event", "move_event"):
-        bad = check_weekday(args["date"], args.get("weekday", ""))
-        if bad:
-            return bad
     if name == "add_event":
         return add_event(args["title"], args["date"], args["note"], "에이블", args["start"], args["end"],
                          args["category"])
@@ -1806,14 +1783,12 @@ def system_prompt():
     lines = [
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 요청한 업무를 최선을 다해 처리합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일), 현재 시각: {now_kst()[11:]}",
-        date_table(),
         f"김 대리 이메일: {my_email() or '(미설정)'}",
         "",
         "규칙",
         "- [현재 업무 데이터], [최근 회의], 첨부 파일, 이전 대화에 있는 내용만 근거로 답합니다.",
         "  근거가 없는 내용은 지어내지 말고 '확인되지 않는 내용입니다'라고 말합니다.",
-        "- '이번 주 목요일', '모레 오후 3시' 같은 표현은 [날짜표]에서 날짜를 찾아 YYYY-MM-DD, HH:MM으로 도구에 넘깁니다.",
-        "  요일을 말했으면 add_event·move_event의 weekday에 그 요일을 넣습니다. 요일이 맞지 않는다는 결과가 오면 날짜표를 다시 보고 고칩니다.",
+        "- '다음 주 금요일', '모레 오후 3시' 같은 표현은 오늘 기준 YYYY-MM-DD, HH:MM으로 바꿔 도구에 넘깁니다.",
         "- 할 일/일정 추가, 일정 변경, 완료 처리를 요청하면 해당 도구를 사용합니다. 제목에 이모티콘을 넣지 않습니다.",
         f"- 일정 종류: {' / '.join(EVENT_CATS)} 중 내용에 맞게 고릅니다. (김 대리가 직접 정한 종류 목록)",
         f"- 할 일 분류: {' / '.join(TODO_CATS)} 중 내용에 맞게 고릅니다.",
@@ -2007,8 +1982,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-            if not (isinstance(result, dict) and result.get("retry")):
-                actions.append(act)
+            actions.append(act)
             inputs.append({"type": "function_call_output", "call_id": c.call_id,
                            "output": json.dumps(result, ensure_ascii=False)})
     return resp.output_text or "요청을 처리했습니다.", actions, mail
@@ -2196,7 +2170,6 @@ def analyze_meeting(text, title="", attendees=""):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 회의 원문을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 회의는 오늘 열렸다고 가정합니다.",
-        date_table(),
         "원문이 음성 인식 결과일 수 있어 오탈자가 있을 수 있습니다. 문맥상 분명한 것만 바로잡습니다.",
         "",
         "[작성 규칙]",
@@ -2483,7 +2456,6 @@ def analyze_mails(mails):
     instructions = "\n".join([
         "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 받은 메일을 분석합니다.",
         f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일). 여기서 '원문'은 각 메일의 제목과 본문입니다.",
-        date_table(),
         "메일마다 index(입력 번호 그대로), category, summary(1~2문장), kim_tasks, events, needs_reply, reply_draft를 씁니다.",
         *TASK_RULES,
         "- 메일을 받은 김 대리에게 요청된 일이 kim_tasks입니다. 광고·자동 알림·단순 공유면 빈 배열.",
@@ -2986,26 +2958,34 @@ with st.sidebar:
                           help="대화 삭제", use_container_width=True)
         st.caption(f"최근 대화 {MAX_CHATS}개까지 보관하고, 대화마다 최근 질문·답변 {MAX_TURNS}개를 기억해요.")
 
-    # 1) 앞으로 3일 할 일
+    # 1) 앞으로 3일 일정·할 일 마감 (매 실행마다 data에서 다시 계산 → 등록·수정·삭제 즉시 반영)
     undone_all = [t for t in data["todos"] if not t["done"]]
     overdue = sorted([t for t in undone_all if parse_date(t["due"]) and parse_date(t["due"]) < today],
                      key=lambda t: t["due"])
     days3 = [today + dt.timedelta(days=i) for i in range(3)]
-    soon = {d: [t for t in undone_all if parse_date(t["due"]) == d] for d in days3}
-    n_soon = sum(len(v) for v in soon.values())
-    with st.expander(f"✅ 앞으로 3일 할 일 ({n_soon}건)"):
-        st.caption("분류별 색으로 구분해요.")
+    ev3 = {d: sorted([e for e in data["events"] if parse_date(e["date"]) == d],
+                     key=lambda e: e["start"] or "00:00") for d in days3}
+    td3 = {d: sorted([t for t in undone_all if parse_date(t["due"]) == d],
+                     key=lambda t: PRIORITY_ORDER.get(t["priority"], 1)) for d in days3}
+    n_ev3 = sum(len(v) for v in ev3.values())
+    n_td3 = sum(len(v) for v in td3.values())
+    with st.expander(f"📅 앞으로 3일 (일정 {n_ev3} · 마감 {n_td3})", expanded=True):
+        st.caption("일정은 종류별 색, 할 일은 분류별 색으로 구분해요.")
         if overdue:
-            st.markdown("**기한 지남**")
+            st.markdown("**⚠️ 기한 지난 할 일**")
             for t in overdue:
                 st.markdown(todo_html(t), unsafe_allow_html=True)
         for d, label in zip(days3, ["오늘", "내일", "모레"]):
             st.markdown(f"**{label} · {fmt_date(d)}**")
-            if soon[d]:
-                for t in sorted(soon[d], key=lambda x: PRIORITY_ORDER[x["priority"]]):
-                    st.markdown(todo_html(t), unsafe_allow_html=True)
-            else:
-                st.caption("마감인 할 일 없음")
+            if not ev3[d] and not td3[d]:
+                st.caption("일정·마감 없음")
+                continue
+            for e in ev3[d]:
+                st.markdown(f'{badge(e["category"], ev_color(e))}<b>{html.escape(e["title"])}</b>'
+                            f'<br><span class="able-meta">🕒 {event_time_text(e)}</span>',
+                            unsafe_allow_html=True)
+            for t in td3[d]:
+                st.markdown(todo_html(t), unsafe_allow_html=True)
         no_due = sum(1 for t in undone_all if not t["due"])
         if no_due:
             st.caption(f"기한 없는 할 일 {no_due}건은 📊 대시보드에서 확인하세요.")
