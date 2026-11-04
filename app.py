@@ -2589,12 +2589,42 @@ with tab_meet:
         b3.download_button("⬇️ 원문 (.txt)", n["text"], file_name=f"회의원문_{n['when'][:10]}.txt",
                            mime="text/plain", use_container_width=True)
         if b4.button("🗑️ 이 회의록 삭제", use_container_width=True):
-            added = {t.get("todo_id") for t in n["kim_tasks"] if t["status"] in ("calendar", "approximate", "nodue")}
-            data["todos"] = [x for x in data["todos"] if x["id"] not in added]
-            data["meeting_notes"] = [x for x in notes if x["id"] != n["id"]]
-            save_data()
-            st.session_state.pending_toast = "회의록과 이 회의에서 추가한 할 일을 지웠어요."
-            st.rerun()
+            st.session_state.meeting_delete_pending = n["id"]
+
+        if st.session_state.get("meeting_delete_pending") == n["id"]:
+            linked_ids = {t.get("todo_id") for t in n["kim_tasks"] if t.get("todo_id")}
+            linked_count = sum(t["id"] in linked_ids for t in data["todos"])
+            with st.container(border=True):
+                st.markdown("#### 🗑️ 삭제할 범위를 선택해 주세요")
+                scope = st.radio(
+                    "삭제 범위",
+                    ["회의록만 삭제", "회의록과 연결된 할 일도 삭제"],
+                    index=0,
+                    key=f"meeting_delete_scope_{n['id']}",
+                )
+                if scope == "회의록만 삭제":
+                    st.info("회의 원문과 요약을 삭제합니다. 연결된 할 일과 캘린더 마감 표시는 유지됩니다.")
+                else:
+                    st.warning(f"회의록과 연결된 할 일 {linked_count}건을 함께 삭제합니다. "
+                               "해당 할 일의 캘린더 마감 표시도 사라집니다. 별도로 등록한 일정은 유지됩니다.")
+                cancel_col, confirm_col = st.columns(2)
+                if cancel_col.button("취소", key=f"meeting_delete_cancel_{n['id']}", use_container_width=True):
+                    st.session_state.pop("meeting_delete_pending", None)
+                    st.rerun()
+                if confirm_col.button("선택한 항목 삭제", key=f"meeting_delete_confirm_{n['id']}",
+                                      type="primary", use_container_width=True):
+                    delete_tasks = scope == "회의록과 연결된 할 일도 삭제"
+                    if delete_tasks:
+                        data["todos"] = [t for t in data["todos"] if t["id"] not in linked_ids]
+                    data["meeting_notes"] = [item for item in data["meeting_notes"] if item["id"] != n["id"]]
+                    save_data()
+                    st.session_state.pop("meeting_delete_pending", None)
+                    st.session_state.pop("meet_view", None)
+                    st.session_state.pending_toast = (
+                        f"회의록과 연결된 할 일 {linked_count}건을 삭제했어요."
+                        if delete_tasks else "회의록만 삭제했어요. 할 일과 캘린더 마감 표시는 유지했어요."
+                    )
+                    st.rerun()
         with st.expander("🗣️ 회의 원문 / 녹취록 보기"):
             st.text(n["text"])
 
