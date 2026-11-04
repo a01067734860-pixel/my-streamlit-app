@@ -10,7 +10,7 @@ from types import NoneType
 #   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
-#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 할 일 / 최근 회의록 요약 / 최근 받은 메일 5개 요약
+#   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
 #   일정     : 종류별 색상·소요시간 추정(체크인 20/회의 30/온라인 45/고객사 60분), 겹치거나 간격 10분 미만이면
 #              충돌 감지 → 대체 시간 3개 추천 → 승인(대체 시간/원래 시간/취소), 음성·텍스트 요청도 동일하게 검사
 import os
@@ -1274,10 +1274,20 @@ def _toggle_from_dialog(todo_id):
     done = st.session_state[f"dlg_chk_{todo_id}"]
     set_todo_done(todo_id, done)
     st.session_state[f"chk_{todo_id}"] = done  # 대시보드 목록의 체크박스도 같이 맞춤
+    st.session_state.dlg_dirty = True           # 콜백 안에서는 rerun이 안 되므로 표시만 해 둠
+
+
+def _refresh_day(d):
+    # 팝업(fragment) 안에서 데이터가 바뀌면 앱 전체를 다시 실행해 사이드바·상단 칩·캘린더까지 반영하고,
+    # 같은 날짜 팝업을 다시 열어 팝업이 닫히지 않은 것처럼 보이게 함
+    st.session_state.dlg_reopen = d.isoformat()
+    st.rerun()
 
 
 @st.dialog("하루 일정", width="large")
 def day_dialog(d):
+    if st.session_state.pop("dlg_dirty", False):     # 팝업 안 체크박스로 완료 처리한 경우
+        _refresh_day(d)
     iso = d.isoformat()
     st.markdown(f"### {d.year}년 {d.month}월 {d.day}일 ({WEEKDAYS[d.weekday()]}) · {d_day(d)}")
 
@@ -1294,7 +1304,7 @@ def day_dialog(d):
                     st.session_state.dlg_edit = None
                     if r["status"] == "needs_approval":
                         st.rerun()             # 충돌 → 창을 닫고 화면 위에서 시간 선택
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
                 if st.button("취소", key=f"dlg_edit_cancel_{e['id']}"):
                     st.session_state.dlg_edit = None
                     st.rerun(scope="fragment")
@@ -1309,7 +1319,7 @@ def day_dialog(d):
                     st.rerun(scope="fragment")
                 if dl:
                     delete_item("events", e["id"])
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
 
     todos = [t for t in data["todos"] if t["due"] == iso]
     st.markdown(f"#### 이 날 마감인 할 일 ({len(todos)}건)")
@@ -1322,7 +1332,7 @@ def day_dialog(d):
                 if f:
                     update_todo(t["id"], **f)
                     st.session_state.dlg_edit_td = None
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
                 if st.button("취소", key=f"dlg_td_cancel_{t['id']}"):
                     st.session_state.dlg_edit_td = None
                     st.rerun(scope="fragment")
@@ -1339,7 +1349,7 @@ def day_dialog(d):
                     st.rerun(scope="fragment")
                 if dl:
                     delete_item("todos", t["id"])
-                    st.rerun(scope="fragment")
+                    _refresh_day(d)
 
     st.markdown("#### 이 날에 추가")
     kind = st.radio("종류", ["일정", "할 일(마감)"], horizontal=True, key=f"dlg_kind_{iso}",
@@ -1350,15 +1360,15 @@ def day_dialog(d):
             r = add_event(f["title"], f["date"], f["note"], "직접 입력", f["start"], f["end"], f["category"])
             if r["status"] == "needs_approval":
                 st.rerun()
-            st.rerun(scope="fragment")
+            _refresh_day(d)
     else:
         f = todo_form(f"dlg_add_td_{iso}", default_due=d)
         if f:
             add_todo(f["title"], f["due"], f["priority"], f["detail"], "직접 입력", f["category"])
-            st.rerun(scope="fragment")
+            _refresh_day(d)
 
     st.divider()
-    if st.button("닫고 캘린더에 반영", type="primary", use_container_width=True):
+    if st.button("닫기", type="primary", use_container_width=True):
         st.rerun()
 
 
@@ -1371,16 +1381,18 @@ def render_calendar(year, month):
         color = "#e5484d" if i == 0 else "#3e7bfa" if i == 6 else "inherit"
         head[i].markdown(f'<div class="cal-head" style="color:{color}">{w}</div>', unsafe_allow_html=True)
 
+    reopen = st.session_state.pop("dlg_reopen", None)     # 팝업에서 바꾼 뒤 같은 날짜 팝업 다시 열기
     with st.container(key="able_cal"):
         for week in weeks:
             cols = st.columns(7)
             for i, d in enumerate(week):
                 with cols[i]:
                     items = m.get(d, [])
-                    if st.button(str(d.day), key=f"day_{d.isoformat()}",
-                                 type="primary" if d == today else "secondary",
-                                 use_container_width=True,
-                                 help=f"{d.month}월 {d.day}일 일정 보기·추가·수정·삭제"):
+                    clicked = st.button(str(d.day), key=f"day_{d.isoformat()}",
+                                        type="primary" if d == today else "secondary",
+                                        use_container_width=True,
+                                        help=f"{d.month}월 {d.day}일 일정 보기·추가·수정·삭제")
+                    if clicked or reopen == d.isoformat():
                         day_dialog(d)
                     pills = "".join(pill_html(k, lb, c) for _, k, lb, c in items[:2])
                     if len(items) > 2:
@@ -3158,26 +3170,34 @@ with st.sidebar:
                           help="대화 삭제", use_container_width=True)
         st.caption(f"최근 대화 {MAX_CHATS}개까지 보관하고, 대화마다 최근 질문·답변 {MAX_TURNS}개를 기억해요.")
 
-    # 1) 앞으로 3일 할 일
+    # 1) 앞으로 3일 일정·할 일 마감 (매 실행마다 data에서 다시 계산 → 등록·수정·삭제 즉시 반영)
     undone_all = [t for t in data["todos"] if not t["done"]]
     overdue = sorted([t for t in undone_all if parse_date(t["due"]) and parse_date(t["due"]) < today],
                      key=lambda t: t["due"])
     days3 = [today + dt.timedelta(days=i) for i in range(3)]
-    soon = {d: [t for t in undone_all if parse_date(t["due"]) == d] for d in days3}
-    n_soon = sum(len(v) for v in soon.values())
-    with st.expander(f"✅ 앞으로 3일 할 일 ({n_soon}건)"):
-        st.caption("분류별 색으로 구분해요.")
+    ev3 = {d: sorted([e for e in data["events"] if parse_date(e["date"]) == d],
+                     key=lambda e: e["start"] or "00:00") for d in days3}
+    td3 = {d: sorted([t for t in undone_all if parse_date(t["due"]) == d],
+                     key=lambda t: PRIORITY_ORDER.get(t["priority"], 1)) for d in days3}
+    n_ev3 = sum(len(v) for v in ev3.values())
+    n_td3 = sum(len(v) for v in td3.values())
+    with st.expander(f"📅 앞으로 3일 (일정 {n_ev3} · 마감 {n_td3})", expanded=True):
+        st.caption("일정은 종류별 색, 할 일은 분류별 색으로 구분해요.")
         if overdue:
-            st.markdown("**기한 지남**")
+            st.markdown("**⚠️ 기한 지난 할 일**")
             for t in overdue:
                 st.markdown(todo_html(t), unsafe_allow_html=True)
         for d, label in zip(days3, ["오늘", "내일", "모레"]):
             st.markdown(f"**{label} · {fmt_date(d)}**")
-            if soon[d]:
-                for t in sorted(soon[d], key=lambda x: PRIORITY_ORDER[x["priority"]]):
-                    st.markdown(todo_html(t), unsafe_allow_html=True)
-            else:
-                st.caption("마감인 할 일 없음")
+            if not ev3[d] and not td3[d]:
+                st.caption("일정·마감 없음")
+                continue
+            for e in ev3[d]:
+                st.markdown(f'{badge(e["category"], ev_color(e))}<b>{html.escape(e["title"])}</b>'
+                            f'<br><span class="able-meta">🕒 {event_time_text(e)}</span>',
+                            unsafe_allow_html=True)
+            for t in td3[d]:
+                st.markdown(todo_html(t), unsafe_allow_html=True)
         no_due = sum(1 for t in undone_all if not t["due"])
         if no_due:
             st.caption(f"기한 없는 할 일 {no_due}건은 📊 대시보드에서 확인하세요.")
