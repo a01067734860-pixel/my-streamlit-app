@@ -1904,7 +1904,7 @@ def _decide_cb(choice):
     else:
         st.session_state.pending_toast = f"⚠️ {r['error']}"
 
-
+'''
 def render_pending_event():
     # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
     p = st.session_state.get("pending_event")
@@ -1936,6 +1936,241 @@ def render_pending_event():
         a, b, _ = st.columns([1.4, 1, 3])
         a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
         b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
+        '''
+
+        def render_pending_event():
+    from datetime import datetime
+
+    p = st.session_state.get("pending_event")
+    if not p:
+        return
+
+    f = p["fields"]
+    event_id = p.get("event_id")
+    what = "수정" if p.get("mode") == "edit" else "추가"
+
+    conflicts = find_conflicts(
+        f["date"], f["start"], f["end"], event_id
+    )
+
+    original_date = parse_date(f["date"])
+    original_start = datetime.combine(
+        original_date, parse_time(f["start"])
+    )
+
+    # 원본 인덱스를 보존해야 기존 _decide_cb가
+    # 사용자가 선택한 대체 시간을 정확히 찾을 수 있습니다.
+    suggestions = []
+
+    for original_index, slot in enumerate(p.get("suggestions") or []):
+        slot_date = parse_date(slot["date"])
+        slot_start = datetime.combine(
+            slot_date, parse_time(slot["start"])
+        )
+
+        available = is_free(
+            slot["date"],
+            parse_time(slot["start"]),
+            parse_time(slot["end"]),
+            event_id,
+        )
+
+        suggestions.append({
+            "slot": slot,
+            "original_index": original_index,
+            "available": available,
+            "same_day": slot_date == original_date,
+            "difference_minutes": int(
+                (slot_start - original_start).total_seconds() / 60
+            ),
+        })
+
+    # 선택 가능한 시간 → 같은 날 → 원래 시간과 가까운 순
+    suggestions.sort(
+        key=lambda item: (
+            not item["available"],
+            not item["same_day"],
+            abs(item["difference_minutes"]),
+            item["original_index"],
+        )
+    )
+
+    with st.container(border=True):
+        event_description = (
+            f"{what}하려는 '{f['title']}' "
+            f"({fmt_date(original_date)} "
+            f"{event_time_text(f)}, {f['category']})"
+        )
+
+        if conflicts:
+            st.warning(f"⚠️ 일정 충돌 감지 — {event_description}")
+
+            st.markdown("**충돌하는 기존 일정**")
+
+            conflict_lines = []
+
+            for conflict in conflicts:
+                conflict_lines.append(
+                    f"{badge(conflict['category'], ev_color(conflict))}"
+                    f"{html.escape(str(conflict['title']))} · "
+                    f"{html.escape(str(event_time_text(conflict)))}"
+                    f" — <b>"
+                    f"{html.escape(str(conflict.get('reason', '일정 충돌')))}"
+                    f"</b>"
+                )
+
+            st.markdown(
+                "<br>".join(conflict_lines),
+                unsafe_allow_html=True,
+            )
+
+            st.caption(
+                "기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. "
+                "대체 시간을 선택하거나 원래 시간으로 등록할 수 있어요."
+            )
+
+            st.markdown("**대체 시간 추천**")
+
+            with st.expander("추천 기준 보기", expanded=False):
+                st.write(
+                    "업무 시간 09:00–18:00 · "
+                    "점심시간 12:00–13:00 제외 · "
+                    "일정 앞뒤 10분 여유"
+                )
+                st.caption(
+                    "선택 가능한 시간을 우선하고, 같은 날의 시간부터 "
+                    "원래 시작 시간과 가까운 순서로 표시해요."
+                )
+
+            if suggestions:
+                available_count = sum(
+                    item["available"] for item in suggestions
+                )
+
+                if available_count == 0:
+                    st.info(
+                        "기존 추천 시간에도 충돌이 생겼어요. "
+                        "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                    )
+
+                # 추천 개수가 많아도 한 줄에 최대 3개만 표시
+                for row_start in range(0, len(suggestions), 3):
+                    row = suggestions[row_start:row_start + 3]
+                    cols = st.columns(len(row))
+
+                    for offset, item in enumerate(row):
+                        display_index = row_start + offset
+                        slot = item["slot"]
+                        available = item["available"]
+
+                        with cols[offset]:
+                            with st.container(border=True):
+                                if available and display_index == 0:
+                                    st.markdown("**⭐ 우선 추천**")
+                                else:
+                                    st.markdown(
+                                        f"**대체 시간 {display_index + 1}**"
+                                    )
+
+                                # Markdown 특수문자의 영향을 받지 않도록 출력
+                                st.text(slot_text(slot))
+
+                                if available:
+                                    if item["same_day"]:
+                                        delta = item["difference_minutes"]
+
+                                        if delta == 0:
+                                            reason = "원래 시작 시간과 같아요."
+                                        else:
+                                            direction = (
+                                                "늦춘" if delta > 0 else "앞당긴"
+                                            )
+                                            hours, minutes = divmod(
+                                                abs(delta), 60
+                                            )
+
+                                            duration_parts = []
+                                            if hours:
+                                                duration_parts.append(
+                                                    f"{hours}시간"
+                                                )
+                                            if minutes:
+                                                duration_parts.append(
+                                                    f"{minutes}분"
+                                                )
+
+                                            duration_text = " ".join(
+                                                duration_parts
+                                            )
+
+                                            reason = (
+                                                "원래 일정과 같은 날이에요. "
+                                                f"시작을 {duration_text} "
+                                                f"{direction} 시간이에요."
+                                            )
+                                    else:
+                                        reason = (
+                                            "다른 날짜에 확보할 수 있는 "
+                                            "대체 시간이에요."
+                                        )
+
+                                    st.caption(reason)
+                                    st.caption("✅ 현재 충돌 없음")
+                                else:
+                                    st.caption(
+                                        "⛔ 다른 일정과 충돌해 선택할 수 없어요."
+                                    )
+
+                                st.button(
+                                    "이 시간으로 등록",
+                                    key=(
+                                        f"pe_s{item['original_index']}"
+                                    ),
+                                    on_click=_decide_cb,
+                                    args=(
+                                        str(item["original_index"] + 1),
+                                    ),
+                                    use_container_width=True,
+                                    disabled=not available,
+                                    type=(
+                                        "primary"
+                                        if available and display_index == 0
+                                        else "secondary"
+                                    ),
+                                )
+            else:
+                st.info(
+                    "2주 안에서 조건에 맞는 업무 시간을 찾지 못했어요. "
+                    "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                )
+
+        else:
+            st.success("✅ 일정 충돌이 해소됐어요.")
+            st.write(event_description)
+            st.caption("원래 시간으로 등록할 수 있어요.")
+
+        st.divider()
+
+        a, b = st.columns([2, 1])
+
+        a.button(
+            "충돌을 감수하고 원래 시간으로 등록"
+            if conflicts
+            else "원래 시간으로 등록",
+            key="pe_orig",
+            on_click=_decide_cb,
+            args=("original",),
+            use_container_width=True,
+            type="secondary" if conflicts else "primary",
+        )
+
+        b.button(
+            "취소",
+            key="pe_cancel",
+            on_click=_decide_cb,
+            args=("cancel",),
+            use_container_width=True,
+        )
 
 
 # ─────────────────────────────────────────────
