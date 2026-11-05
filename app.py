@@ -2187,7 +2187,274 @@ def render_pending_event():
             use_container_width=True,
         )
 
+# ─────────────────────────────────────────────
+# 퇴근 10분 전 내일 브리핑
+# 이 블록 전체를 기존 "# 화면" 바로 위에 추가
+# ─────────────────────────────────────────────
 
+@st.fragment(run_every="30s")
+def render_leave_briefing():
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    # 기존 앱 데이터 구조 사용
+    app_data = st.session_state.data
+    settings = app_data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+
+    now = briefing_dt.datetime.now(seoul)
+    current_date = now.date()
+    next_date = current_date + briefing_dt.timedelta(days=1)
+    current_iso = current_date.isoformat()
+    next_iso = next_date.isoformat()
+
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+
+    # 기존 설정과 충돌하지 않도록 전용 키 사용
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+
+    try:
+        saved_time = briefing_dt.time.fromisoformat(
+            settings["leave_briefing_time"]
+        )
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+
+    # 위젯이 화면에서 사라졌다가 다시 생겨도 저장값 복원
+    st.session_state.setdefault(
+        "lb_enabled_widget",
+        settings["leave_briefing_enabled"],
+    )
+    st.session_state.setdefault(
+        "lb_time_widget",
+        saved_time,
+    )
+
+    with st.expander("🌙 퇴근 전 내일 브리핑 설정", expanded=False):
+        enabled = st.checkbox(
+            "퇴근 10분 전 브리핑 받기",
+            key="lb_enabled_widget",
+        )
+
+        leave_time = st.time_input(
+            "퇴근 시간",
+            key="lb_time_widget",
+            step=300,
+        )
+
+        st.caption(
+            "한국 시간 기준 · 앱이 열려 있는 동안 30초마다 확인해요. "
+            "내일은 주말·공휴일을 포함한 다음 날짜예요."
+        )
+
+        preview_clicked = st.button(
+            "👀 내일 브리핑 미리보기",
+            key="lb_preview_button",
+            use_container_width=True,
+        )
+
+    # 설정이 변경된 경우에만 기존 저장 함수 호출
+    leave_text = leave_time.strftime("%H:%M")
+
+    if (
+        settings["leave_briefing_enabled"] != enabled
+        or settings["leave_briefing_time"] != leave_text
+    ):
+        settings["leave_briefing_enabled"] = enabled
+        settings["leave_briefing_time"] = leave_text
+        save_data()
+
+    leave_at = briefing_dt.datetime.combine(
+        current_date,
+        leave_time,
+        tzinfo=seoul,
+    )
+    notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+
+    acknowledged = (
+        settings["leave_briefing_ack_date"] == current_iso
+    )
+
+    # 알림 시작 이후, 확인할 때까지 당일 표시
+    auto_show = (
+        enabled
+        and now >= notification_at
+        and not acknowledged
+    )
+
+    if preview_clicked:
+        st.session_state["lb_preview_date"] = current_iso
+
+    preview_show = (
+        st.session_state.get("lb_preview_date") == current_iso
+    )
+
+    if not (auto_show or preview_show):
+        return
+
+    # 자동 알림 토스트: 현재 세션에서 하루 한 번
+    if (
+        auto_show
+        and st.session_state.get("lb_toast_date") != current_iso
+    ):
+        st.toast(
+            "김 대리님, 퇴근 전 내일 일정을 확인하세요.",
+            icon="🌙",
+        )
+        st.session_state["lb_toast_date"] = current_iso
+
+    # 일정: date / start / end / category / note
+    next_events = sorted(
+        [
+            event
+            for event in app_data.get("events", [])
+            if event.get("date") == next_iso
+        ],
+        key=lambda event: event.get("start") or "00:00",
+    )
+
+    # 할 일: due / done / priority / detail
+    next_todos = sorted(
+        [
+            todo
+            for todo in app_data.get("todos", [])
+            if todo.get("due") == next_iso
+            and not todo.get("done", False)
+        ],
+        key=lambda todo: (
+            PRIORITY_ORDER.get(todo.get("priority", "보통"), 1),
+            todo.get("title", ""),
+        ),
+    )
+
+    # 기존 앱의 충돌 판단 기준 재사용
+    # 실제 시간 겹침뿐 아니라 앞뒤 여유 부족도 포함
+    conflict_pairs = []
+
+    for index, first in enumerate(next_events):
+        first_span = event_span(first)
+        if first_span is None:
+            continue
+
+        for second in next_events[index + 1:]:
+            second_span = event_span(second)
+            if second_span is None:
+                continue
+
+            reason = conflict_reason(first_span, second_span)
+            if reason:
+                conflict_pairs.append((first, second, reason))
+
+    next_label = (
+        f"{next_date.month}/{next_date.day}"
+        f"({weekdays[next_date.weekday()]})"
+    )
+
+    with st.container(border=True):
+        st.subheader("🌙 김 대리님의 내일 브리핑")
+        st.caption(
+            f"내일 {next_label} · "
+            f"퇴근 시간 {leave_text} · 한국 시간 기준"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("내일 일정", f"{len(next_events)}건")
+        c2.metric("내일 마감", f"{len(next_todos)}건")
+        c3.metric("일정 충돌·간격 부족", f"{len(conflict_pairs)}건")
+
+        st.markdown("**📅 내일 일정**")
+
+        if not next_events:
+            st.caption("내일 등록된 일정이 없어요.")
+        else:
+            for event in next_events:
+                # 기존 시간 표시 함수 사용: 종일 일정도 처리
+                st.text(
+                    f"• {event_time_text(event)} | "
+                    f"{event.get('title', '제목 없음')}"
+                )
+
+                category = event.get("category", "")
+                if category:
+                    st.caption(f"분류: {category}")
+
+                note = event.get("note", "")
+                if note:
+                    with st.expander(
+                        f"📝 {event.get('title', '일정')} 메모"
+                    ):
+                        st.text(note)
+
+        st.markdown("**⏰ 내일 마감인 미완료 업무**")
+
+        if not next_todos:
+            st.caption("내일 마감인 미완료 업무가 없어요.")
+        else:
+            for todo in next_todos:
+                priority = todo.get("priority", "보통")
+
+                st.text(
+                    f"• [{priority}] "
+                    f"{todo.get('title', '제목 없음')}"
+                )
+
+                detail = todo.get("detail", "")
+                if detail:
+                    with st.expander(
+                        f"📋 {todo.get('title', '업무')} 상세"
+                    ):
+                        st.text(detail)
+
+            st.caption(
+                "현재 할 일에는 마감 날짜만 저장되어 있어요. "
+                "구체적인 마감 시간은 업무 상세 내용을 확인해 주세요."
+            )
+
+        if conflict_pairs:
+            st.warning(
+                "내일 일정이 겹치거나 일정 사이 여유가 부족해요."
+            )
+
+            for first, second, reason in conflict_pairs:
+                st.text(
+                    f"• {first.get('title', '제목 없음')} "
+                    f"({event_time_text(first)})"
+                    f" ↔ {second.get('title', '제목 없음')} "
+                    f"({event_time_text(second)})"
+                    f" — {reason}"
+                )
+
+        if not next_events and not next_todos:
+            st.success(
+                "내일 등록된 일정과 마감 업무가 없어요. "
+                "편안하게 하루를 마무리하세요."
+            )
+
+        st.divider()
+
+        def acknowledge_briefing():
+            # 클릭 시점의 한국 날짜 사용
+            ack_date = briefing_dt.datetime.now(seoul).date().isoformat()
+            st.session_state.data["settings"][
+                "leave_briefing_ack_date"
+            ] = ack_date
+
+            st.session_state.pop("lb_preview_date", None)
+            save_data()
+
+        st.button(
+            "✅ 확인 완료 · 오늘 브리핑 닫기",
+            key="lb_ack_button",
+            on_click=acknowledge_briefing,
+            use_container_width=True,
+            type="primary",
+        )
+
+
+# 반드시 함수 정의 바로 아래에 함께 추가
+render_leave_briefing()
 
 # ─────────────────────────────────────────────
 # 화면
