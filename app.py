@@ -1224,15 +1224,22 @@ def review_email(rcpt, subject, body, context=""):
         resp = get_client().responses.create(
             model=MODEL,
             instructions="\n".join([
-                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 점검합니다.",
+                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 한 번 점검합니다.",
+                f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
+                date_table(),
                 "아래 다섯 항목을 모두 점검해 항목마다 ok(true/false)와 짧은 comment를 씁니다.",
+                "실제로 잘못 보낼 위험이 있을 때만 false로 하고, 사소하거나 애매하면 ok=true로 둡니다.",
                 "- 받는 사람: [요청/상황]에서 의도한 사람과 [받는 사람] 정보가 맞는지. 요청에 받는 사람 언급이 없으면 ok.",
-                "- 내용 정확성: 본문에 [요청/상황]·[참고 자료]에 없는 날짜·숫자·약속·사실이 들어갔는지. 지어낸 내용이 있으면 false.",
+                "- 내용 정확성: 본문의 날짜·숫자·약속이 [요청/상황]·[이전 대화]·[참고 자료]와 '어긋날' 때만 false.",
+                "  '내일', '금요일', '다음 주 화요일'처럼 요청한 표현을 [날짜표]에 맞는 실제 날짜(예: 11월 7일)로 바꿔 쓴 것은 정상(ok)입니다.",
+                "  요일과 날짜가 날짜표와 맞지 않거나, 요청과 다른 날짜·금액이 들어간 경우만 문제입니다.",
+                "  메일에 흔히 들어가는 인사·마무리 문장, 요청 내용을 정리한 표현은 지어낸 내용이 아닙니다.",
                 "- 빠진 내용: 요청한 내용이 빠졌는지, '첨부'를 언급했는데 실제 첨부가 없는지(이 메일은 첨부를 보낼 수 없음).",
                 "- 말투·맞춤법: 받는 사람에게 맞는 정중한 말투인지, 오탈자가 있는지.",
                 "- 민감 정보: 비밀번호·주민번호·계좌번호 같은 민감 정보가 들어 있는지.",
                 "비교할 자료가 없어 판단할 수 없으면 추측하지 말고 ok=true, comment에 '비교할 자료 없음'이라고 씁니다.",
-                "summary: 김 대리에게 하는 한 문장 결론 (예: '보내도 괜찮아 보여요.' / '요청에 없는 날짜가 있어 확인이 필요해요.').",
+                "summary: 김 대리에게 하는 한 문장 결론. 문제가 없으면 '보내도 괜찮아 보여요.',",
+                "  문제가 있으면 무엇이 왜 문제인지 구체적으로 (예: '요청은 금요일인데 본문에 목요일(11/6)로 적혀 있어요.').",
             ]),
             input=(f"[받는 사람] {who} <{rcpt['email']}>\n\n[요청/상황]\n{context or '(없음)'}\n\n"
                    f"[제목] {subject}\n\n[본문]\n{body}"),
@@ -2641,7 +2648,9 @@ def system_prompt():
         "- 메일을 보내 달라고 하면 메일을 쓰고 send_email까지 반드시 호출합니다. 보낼지 다시 묻지 않습니다.",
         "- send_email 결과가 success면 '메일을 보냈습니다'라고 받는 사람과 제목을 알려 줍니다.",
         "- needs_confirmation이면 아직 보내지 않은 것입니다. AI 확인에서 나온 확인할 점(issues)을 짧게 말하고",
-        "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
+        "  '그래도 보낼까요?'라고 한 번만 묻습니다. 같은 답변 안에서 send_email을 다시 부르지 않습니다.",
+        "  김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send)로 바로 보냅니다(다시 확인하지 않음).",
+        "  내용을 고쳐 달라고 하면 고친 내용으로 send_email을 부르면 확인 없이 바로 발송됩니다.",
         "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
         "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
@@ -2734,15 +2743,47 @@ def save_turn(chat, turn):
     return chat
 
 
-def prepare_email(args, question, via="text"):
-    # send_email 도구: 받는 사람 확인 → AI 점검 → 문제가 없으면 발송
-    #   음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+def pending_mail_of(chat):
+    # 이 대화에서 '보내기 전 확인'을 이미 마치고 김 대리 대답을 기다리는 메일
+    for t in reversed(chat["turns"] if chat else []):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            return t["mail"], t
+    return None, None
+
+
+def prepare_email(args, question, via="text", chat=None, reviewed=None):
+    # send_email 도구: 받는 사람 확인 → AI 점검(메일 한 통에 딱 한 번) → 발송
+    #   · 음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+    #   · 이미 한 번 확인한 메일(이번 답변 안에서 다시 호출 / 확인 대기 중에 '보내줘')은 다시 확인하지 않음
     rcpt, err = resolve_recipient(args["to"])
     if err:
         return {"status": "failed", "error": err}, None, {"ok": False, "text": f"📧 메일 준비 실패 ({err})"}
-    ctx = f"[김 대리 요청]\n{question}\n\n[참고 자료]\n{brief_context()}"
-    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     who = f"{rcpt['name']} <{rcpt['email']}>" if rcpt["name"] else rcpt["email"]
+
+    if reviewed is not None:
+        # 같은 답변 안에서 send_email을 또 부른 경우: 다시 확인하지 않고, 김 대리 대답을 기다리게 함
+        reviewed.update(to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        return ({"status": "needs_confirmation", "already_reviewed": True, "to": rcpt["email"],
+                 "message": "이 메일은 방금 확인을 마쳤습니다. 다시 확인하거나 send_email을 또 부르지 말고, "
+                            "확인할 점을 한 번만 말한 뒤 '그래도 보낼까요?'라고 물어보세요."}, None, None)
+
+    prior, prior_turn = pending_mail_of(chat)
+    if prior is not None and prior["to"].lower() == rcpt["email"].lower():
+        # 앞 답변에서 이미 확인을 마친 메일(같은 받는 사람): 김 대리가 보내라고 했으므로 다시 확인하지 않고 바로 발송
+        sr = send_email(rcpt["email"], args["subject"], args["body"])
+        if sr["status"] != "success":
+            return sr, None, {"ok": False, "text": f"📧 메일 발송 실패 ({sr['error']})"}
+        prior.update(status="sent", to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        save_data()
+        return ({"status": "success", "to": rcpt["email"], "subject": args["subject"],
+                 "note": "발송 전 확인은 앞에서 한 번 마쳤습니다."}, None,
+                {"ok": True, "text": f"📧 메일 발송 완료 → {who} · '{args['subject']}'"})
+
+    history = ""
+    if chat:
+        history = "\n".join(f"김 대리: {t['q']}\n에이블: {t['a'][:300]}" for t in chat["turns"][-4:])
+    ctx = (f"[김 대리 요청]\n{question}\n\n[이전 대화]\n{history or '(없음)'}\n\n[참고 자료]\n{brief_context()}")
+    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     if rv["ok"] and (via == "voice" or not data["settings"].get("confirm_before_send", True)):
         sr = send_email(rcpt["email"], args["subject"], args["body"])
         if sr["status"] == "success":
@@ -2806,6 +2847,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
 
     client = get_client()
     actions, mail = [], None
+    sent_mail = None                     # 이번 답변에서 이미 보낸 메일 (같은 메일을 두 번 보내지 않게)
     asked_delete = False                 # 이번 답변에서 삭제 대상을 보여 줬으면 같은 답변에서는 삭제 금지
     for _ in range(5):  # 도구 호출은 최대 5회 반복
         resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
@@ -2815,9 +2857,20 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
         inputs += resp.output
         for c in calls:
             args = json.loads(c.arguments)
+            if c.name == "send_email" and sent_mail:
+                inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                               "output": json.dumps({"status": "success", "already_sent": True, **sent_mail},
+                                                    ensure_ascii=False)})
+                continue
             if c.name == "send_email":
-                result, new_mail, act = prepare_email(args, question, via)
+                result, new_mail, act = prepare_email(args, question, via, chat, mail)
                 mail = new_mail or mail
+                if result.get("status") == "success":
+                    sent_mail = {"to": result["to"], "subject": args["subject"]}
+                if act is None:                  # 이미 확인한 메일을 다시 부른 경우: 화면에 확인 알림을 또 띄우지 않음
+                    inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                                   "output": json.dumps(result, ensure_ascii=False)})
+                    continue
             elif c.name == "confirm_pending_email":
                 result, act = confirm_pending_mail(chat, args["action"], mail)
             elif c.name == "decide_pending_delete" and asked_delete and args["choice"] != "cancel":
