@@ -1725,7 +1725,8 @@ def count_overlaps():
 # 자연어로 일정 삭제: 대상을 보여 주고 김 대리가 승인한 뒤에만 삭제
 # ─────────────────────────────────────────────
 DELETE_MAX = 5
-DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거"}
+DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거", "할일", "투두", "todo", "업무", "목록"}
+KIND_NAME = {"events": "일정", "todos": "할 일"}
 
 
 def _nospace(s):
@@ -1753,6 +1754,53 @@ def find_delete_candidates(date_iso, keyword):
     return [x[3] for x in scored[:DELETE_MAX]]
 
 
+def todo_due_text(t):
+    d = parse_date(t["due"])
+    return (f"마감 {fmt_date(d)}" if d else "기한 없음") + (" · 완료" if t["done"] else "")
+
+
+def find_todo_delete_candidates(keyword, status):
+    # status: 미완료 / 완료 / 전체. 키워드가 제목·세부 내용·분류에 가장 많이 들어간 할 일만 후보로 (최대 5개)
+    words = [_nospace(w) for w in re.split(r"[\s,]+", keyword or "") if w and _nospace(w) not in DELETE_STOP]
+    pool = [t for t in data["todos"]
+            if status == "전체" or (status == "완료") == bool(t["done"])]
+    if not words and status != "완료":          # 키워드 없이 '전부'는 완료한 할 일 정리일 때만 허용
+        return [], len(pool)
+    scored = []
+    for t in pool:
+        text = _nospace(t["title"] + " " + t.get("detail", ""))      # 분류 이름(예: 조사·분석)은 비교하지 않음
+        score = sum(w in text for w in words)
+        if score or not words:
+            scored.append((-score, PRIORITY_ORDER.get(t["priority"], 1), t["due"] or "9999", t))
+    scored.sort(key=lambda x: x[:3])
+    if scored and words:
+        scored = [x for x in scored if x[0] == scored[0][0]]
+    return [x[3] for x in scored[:DELETE_MAX]], len(scored)
+
+
+def request_delete_todo(keyword, status):
+    # 바로 지우지 않고 삭제할 할 일 후보를 승인 대기(pending_delete)로 저장
+    status = status if status in ("미완료", "완료", "전체") else "미완료"
+    cands, total = find_todo_delete_candidates(keyword, status)
+    if not cands:
+        pool = [t for t in data["todos"] if status == "전체" or (status == "완료") == bool(t["done"])]
+        return {"status": "failed",
+                "error": (f"'{keyword}'에 해당하는 할 일을 찾지 못했습니다." if keyword else
+                          "어떤 할 일을 지울지 알 수 없습니다. 할 일 이름을 알려 달라고 하세요.")
+                         + " 아무것도 삭제하지 않았습니다.",
+                "todos": [f"{t['title']} ({todo_due_text(t)})" for t in pool[:15]]}
+    st.session_state.pending_delete = {"kind": "todos", "ids": [t["id"] for t in cands],
+                                       "query": keyword or f"{status} 할 일"}
+    st.session_state.pending_toast = "⚠️ 삭제할 할 일을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
+    out = {"status": "needs_approval", "kind": "delete_todo",
+           "candidates": [{"no": i + 1, "title": t["title"], "category": t["category"], "when": todo_due_text(t)}
+                          for i, t in enumerate(cands)],
+           "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
+    if total > len(cands):
+        out["note"] = f"조건에 맞는 할 일이 {total}건이라 앞의 {len(cands)}건만 보여 줍니다."
+    return out
+
+
 def request_delete(date_iso, keyword):
     # 바로 지우지 않고 삭제 후보를 승인 대기(pending_delete)로 저장
     if date_iso and not parse_date(date_iso):
@@ -1763,7 +1811,7 @@ def request_delete(date_iso, keyword):
         return {"status": "failed",
                 "error": f"'{keyword or date_iso}'에 해당하는 일정을 찾지 못했습니다. 아무것도 삭제하지 않았습니다.",
                 "events_on_date": [f"{e['title']} ({event_time_text(e)})" for e in same_day]}
-    st.session_state.pending_delete = {"ids": [e["id"] for e in cands], "query": keyword or date_iso}
+    st.session_state.pending_delete = {"kind": "events", "ids": [e["id"] for e in cands], "query": keyword or date_iso}
     st.session_state.pending_toast = "⚠️ 삭제할 일정을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
     return {"status": "needs_approval", "kind": "delete",
             "candidates": [{"no": i + 1, "title": e["title"], "category": e["category"],
@@ -1772,33 +1820,46 @@ def request_delete(date_iso, keyword):
             "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
 
 
+def pending_delete_kind():
+    p = st.session_state.get("pending_delete")
+    return p.get("kind", "events") if p else "events"
+
+
 def pending_delete_events():
+    # 삭제 승인 대기 중인 항목 (일정 또는 할 일)
     p = st.session_state.get("pending_delete")
     if not p:
         return []
-    by_id = {e["id"]: e for e in data["events"]}
+    by_id = {x["id"]: x for x in data[pending_delete_kind()]}
     return [by_id[i] for i in p["ids"] if i in by_id]
+
+
+def delete_item_text(kind, x):
+    if kind == "todos":
+        return f"{x['title']} ({todo_due_text(x)})"
+    return f"{x['title']} ({fmt_date(parse_date(x['date']))} {event_time_text(x)})"
 
 
 def decide_pending_delete(choice):
     # 김 대리 승인: 번호(1~5) / all(후보 전부) / cancel(삭제하지 않음)
     evs = pending_delete_events()
+    kind = pending_delete_kind()
     if not st.session_state.get("pending_delete"):
-        return {"status": "failed", "error": "삭제 승인을 기다리는 일정이 없습니다."}
+        return {"status": "failed", "error": "삭제 승인을 기다리는 일정·할 일이 없습니다."}
     if choice == "cancel" or not evs:
         st.session_state.pop("pending_delete", None)
-        return {"status": "success", "decision": "취소", "deleted": []}
+        return {"status": "success", "decision": "취소", "deleted": [], "kind": KIND_NAME[kind]}
     if choice == "all":
         targets = evs
     elif choice.isdigit() and 1 <= int(choice) <= len(evs):
         targets = [evs[int(choice) - 1]]
     else:
-        return {"status": "failed", "error": f"{choice}번 일정이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
+        return {"status": "failed", "error": f"{choice}번 {KIND_NAME[kind]}이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
     for e in targets:
-        delete_item("events", e["id"])
+        delete_item(kind, e["id"])
     st.session_state.pop("pending_delete", None)
-    return {"status": "success", "decision": "삭제",
-            "deleted": [f"{e['title']} ({fmt_date(parse_date(e['date']))} {event_time_text(e)})" for e in targets]}
+    return {"status": "success", "decision": "삭제", "kind": KIND_NAME[kind],
+            "deleted": [delete_item_text(kind, e) for e in targets]}
 
 
 def _delete_cb(choice):
@@ -1806,9 +1867,9 @@ def _delete_cb(choice):
     if r["status"] != "success":
         st.session_state.pending_toast = f"⚠️ {r['error']}"
     elif r["decision"] == "취소":
-        st.session_state.pending_toast = "일정 삭제를 취소했어요. 일정은 그대로 있어요."
+        st.session_state.pending_toast = f"{r['kind']} 삭제를 취소했어요. 그대로 있어요."
     else:
-        st.session_state.pending_toast = "일정을 삭제했어요: " + ", ".join(r["deleted"])
+        st.session_state.pending_toast = f"{r['kind']}을 삭제했어요: " + ", ".join(r["deleted"])
 
 
 def render_pending_delete():
@@ -1818,12 +1879,14 @@ def render_pending_delete():
     if not evs:                                  # 그 사이 다른 곳에서 지워졌으면 카드 닫기
         st.session_state.pop("pending_delete", None)
         return
+    kind = pending_delete_kind()
+    what = KIND_NAME[kind]
     with st.container(border=True):
-        st.error(f"🗑️ 일정 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 일정 {len(evs)}건")
-        st.caption("승인하기 전에는 삭제하지 않아요. 지울 일정을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
+        st.error(f"🗑️ {what} 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 {what} {len(evs)}건")
+        st.caption(f"승인하기 전에는 삭제하지 않아요. 지울 {what}을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
         for i, e in enumerate(evs):
             a, b = st.columns([5, 1.3])
-            a.markdown(f"**{i + 1}.** " + event_html(e), unsafe_allow_html=True)
+            a.markdown(f"**{i + 1}.** " + (todo_html(e) if kind == "todos" else event_html(e)), unsafe_allow_html=True)
             b.button("🗑️ 삭제", key=f"pd_del_{e['id']}", on_click=_delete_cb, args=(str(i + 1),), type="primary",
                      use_container_width=True)
         c1, c2, _ = st.columns([1.4, 1, 3])
@@ -1862,7 +1925,7 @@ def render_pending_event():
             st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
         sugg = p["suggestions"]
         if sugg:
-            st.markdown("**대체 시간 추천** · 업무 시간 9–18시, 점심 12–13시 제외, 앞뒤 10분 여유")
+            st.markdown("**대체 시간 추천** · 업무 시간 9~18시, 점심 12~13시 제외, 앞뒤 10분 여유")
             cols = st.columns(len(sugg))
             for i, s in enumerate(sugg):
                 ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
@@ -2164,9 +2227,26 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "delete_todo",
+        "description": "할 일을 삭제해 달라고 할 때 사용합니다(완료 처리와 다름). 바로 지우지 않고 삭제 대상을 찾아 화면에 보여 준 뒤 "
+                       "status=needs_approval과 candidates를 돌려줍니다. 김 대리가 승인해야 decide_pending_delete로 삭제됩니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string",
+                            "description": "할 일을 가리키는 말 그대로(예: '경쟁사 분석', '보고서'). "
+                                           "'완료한 할 일 다 지워줘'처럼 이름 없이 정리할 때만 빈 문자열"},
+                "status": {"type": "string", "enum": ["미완료", "완료", "전체"],
+                           "description": "어떤 할 일에서 찾을지. 보통 미완료, '완료한 할 일 지워줘'면 완료, 모르면 전체"},
+            },
+            "required": ["keyword", "status"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "decide_pending_delete",
-        "description": "삭제 승인 대기 중인 일정을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
-                       "번호(1~5): 그 일정 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
+        "description": "삭제 승인 대기 중인 일정·할 일을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
+                       "번호(1~5): 그 항목 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
         "parameters": {
             "type": "object",
             "properties": {"choice": {"type": "string", "enum": ["1", "2", "3", "4", "5", "all", "cancel"]}},
@@ -2189,7 +2269,7 @@ TOOLS = [
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
               "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
               "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일",
-              "delete_event": "일정 삭제", "decide_pending_delete": "삭제 승인"}
+              "delete_event": "일정 삭제", "delete_todo": "할 일 삭제", "decide_pending_delete": "삭제 승인"}
 
 
 def recent_mails_for_chat(count=5):
@@ -2226,6 +2306,8 @@ def run_tool(name, args):
         return decide_pending(args["choice"])
     if name == "delete_event":
         return request_delete(args["date"], args["keyword"].strip())
+    if name == "delete_todo":
+        return request_delete_todo(args["keyword"].strip(), args["status"])
     if name == "decide_pending_delete":
         return decide_pending_delete(args["choice"])
     if name == "get_recent_mails":
@@ -2239,13 +2321,13 @@ def action_of(name, args, result):
     label = TOOL_LABEL.get(name, name)
     if not isinstance(result, dict) or result.get("status") == "failed":
         return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
-    if name == "delete_event":
-        return {"ok": True, "warn": True, "text": "🗑️ 삭제 승인 대기 → "
+    if name in ("delete_event", "delete_todo"):
+        return {"ok": True, "warn": True, "text": f"🗑️ {label} 승인 대기 → "
                 + ", ".join(f"{c['no']}. {c['title']} ({c['when']})" for c in result["candidates"])}
     if name == "decide_pending_delete":
         if result["decision"] == "취소":
-            return {"ok": True, "text": "🗑️ 일정 삭제를 취소했어요 (일정은 그대로 있어요)"}
-        return {"ok": True, "text": "🗑️ 일정 삭제 완료 → " + ", ".join(result["deleted"])}
+            return {"ok": True, "text": f"🗑️ {result['kind']} 삭제를 취소했어요 (그대로 있어요)"}
+        return {"ok": True, "text": f"🗑️ {result['kind']} 삭제 완료 → " + ", ".join(result["deleted"])}
     if result.get("status") == "needs_approval":
         return {"ok": True, "warn": True,
                 "text": f"일정 충돌 감지 → 승인 대기: {result['title']} ({result['requested']}) · "
@@ -2302,6 +2384,10 @@ def system_prompt():
         "  김 대리가 '응/지워줘/1번'이라고 하면 decide_pending_delete(번호, 후보가 하나면 1), '전부' → all,",
         "  '아니/하지 마/취소'라고 하면 cancel입니다. (삭제 승인 대기 중의 '취소'는 삭제를 그만두라는 뜻)",
         "  찾지 못했으면(failed) events_on_date를 알려 주고 어떤 일정인지 묻습니다. 삭제했다고 지어내지 않습니다.",
+        "- 할 일을 지워 달라고 하면(예: '경쟁사 분석 할 일 지워줘', '완료한 할 일 다 지워줘') delete_todo를 사용합니다.",
+        "  '다 했어/끝냈어'는 삭제가 아니라 complete_todo(완료 처리)입니다. 지워 달라고 할 때만 delete_todo를 씁니다.",
+        "  승인 방법은 일정 삭제와 같습니다: 후보를 보여 주고 묻고, 다음 대답에서 decide_pending_delete를 사용합니다.",
+        "  찾지 못했으면(failed) todos 목록을 알려 주고 어떤 할 일인지 묻습니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
@@ -2329,8 +2415,9 @@ def system_prompt():
                   + ", ".join(f"{i + 1}) {slot_text(x)}" for i, x in enumerate(p["suggestions"])), ""]
     pd_evs = pending_delete_events()
     if pd_evs:
-        lines += ["[삭제 승인 대기 중인 일정] (아직 삭제하지 않음)"]
-        lines += [f"{i + 1}) {e['title']} ({e['date']} {event_time_text(e)})" for i, e in enumerate(pd_evs)] + [""]
+        kind = pending_delete_kind()
+        lines += [f"[삭제 승인 대기 중인 {KIND_NAME[kind]}] (아직 삭제하지 않음)"]
+        lines += [f"{i + 1}) {delete_item_text(kind, e)}" for i, e in enumerate(pd_evs)] + [""]
     note = latest_note()
     if note:
         lines += [f"[최근 회의] {note['title']} ({note['when']})", "요약:"]
@@ -2497,7 +2584,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-                if c.name == "delete_event" and result.get("status") == "needs_approval":
+                if c.name in ("delete_event", "delete_todo") and result.get("status") == "needs_approval":
                     asked_delete = True
             if not (isinstance(result, dict) and result.get("retry")):
                 actions.append(act)
