@@ -1903,39 +1903,7 @@ def _decide_cb(choice):
                                           else f"'{r['title']}' 일정을 {r['date']} {r['time']}에 등록했어요.")
     else:
         st.session_state.pending_toast = f"⚠️ {r['error']}"
-"""
-def render_pending_event():
-    # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
-    p = st.session_state.get("pending_event")
-    if not p:
-        return
-    f = p["fields"]
-    conflicts = find_conflicts(f["date"], f["start"], f["end"], p["event_id"])
-    with st.container(border=True):
-        what = "수정" if p["mode"] == "edit" else "추가"
-        st.warning(f"⚠️ 일정 충돌 감지 — {what}하려는 '{f['title']}' "
-                   f"({fmt_date(parse_date(f['date']))} {event_time_text(f)}, {f['category']})")
-        if conflicts:
-            st.markdown("<br>".join(f"{badge(c['category'], ev_color(c))}{html.escape(c['title'])} · "
-                                    f"{event_time_text(c)} — <b>{c['reason']}</b>" for c in conflicts),
-                        unsafe_allow_html=True)
-            st.caption("기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. 어떻게 할까요?")
-        else:
-            st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
-        sugg = p["suggestions"]
-        if sugg:
-            st.markdown("**대체 시간 추천** · 업무 시간 9-18시, 점심 12-13시 제외, 앞뒤 10분 여유")
-            cols = st.columns(len(sugg))
-            for i, s in enumerate(sugg):
-                ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
-                cols[i].button(f"{i + 1}. {slot_text(s)}", key=f"pe_s{i}", on_click=_decide_cb, args=(str(i + 1),),
-                               use_container_width=True, disabled=not ok, type="primary" if i == 0 else "secondary")
-        else:
-            st.caption("2주 안에서 충돌하지 않는 업무 시간을 찾지 못했어요.")
-        a, b, _ = st.columns([1.4, 1, 3])
-        a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
-        b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
-    """
+
 
 def render_pending_event():
     from datetime import datetime, date, time
