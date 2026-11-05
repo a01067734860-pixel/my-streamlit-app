@@ -7,7 +7,7 @@ from types import NoneType
 #   - meeting.txt : (선택) 회의 분석 탭에서 기본으로 불러올 회의록
 #
 # 화면 구성
-#   메인 탭  : 🤖 에이블 비서 (에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
+#   메인 탭  : 🤖 에이블 비서 (입력창 맨 위·최근 대화가 위로, 에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
 #   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
@@ -3337,25 +3337,7 @@ with tab_chat:
             st.caption("예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘 · "
                        "마이크 권한을 물으면 '허용'을 눌러 주세요.")
 
-    for t in turns:
-        with st.chat_message("user", avatar="🧑‍💼"):
-            if t["via"] == "voice":
-                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
-            st.markdown(t["q"])
-            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown(t["a"])
-            for a in t["actions"]:
-                show_action(a)
-            audio = st.session_state.audio_cache.get(t["id"])
-            if audio:
-                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
-
-    for t in turns:
-        if t.get("mail") and t["mail"]["status"] == "pending":
-            render_mail_confirm(t)
-
-    # --- 입력 카드 ---
+    # --- 입력 카드 (맨 위: 말로 지시해도 최근 대화를 바로 볼 수 있게) ---
     with st.container(border=True):
         err = st.session_state.pop("chat_error", None)
         if err:
@@ -3428,6 +3410,36 @@ with tab_chat:
                 done = True
             if done:
                 st.rerun()   # try 밖에서 호출해야 화면 새로고침 신호가 막히지 않음
+
+    # --- 보내기 전 확인 메일 (기다리는 메일이 있으면 대화 기록보다 먼저) ---
+    for t in reversed(turns):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            render_mail_confirm(t)
+
+    # --- 대화 기록: 최근 대화가 맨 위, 아래로 갈수록 이전 대화 ---
+    def render_turn(t):
+        with st.chat_message("user", avatar="🧑‍💼"):
+            if t["via"] == "voice":
+                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
+            st.markdown(t["q"])
+            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(t["a"])
+            for a in t["actions"]:
+                show_action(a)
+            audio = st.session_state.audio_cache.get(t["id"])
+            if audio:
+                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
+
+    if turns:
+        latest, older = turns[-1], list(reversed(turns[:-1]))
+        with st.container(border=True):
+            st.markdown("**🆕 최근 대화**")
+            render_turn(latest)
+        if older:
+            st.markdown(f"**🕘 이전 대화 ({len(older)}개)** · 최근 순")
+            for t in older:
+                render_turn(t)
 
 
 # ─────────────────────────────────────────────
