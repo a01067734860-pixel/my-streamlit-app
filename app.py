@@ -1375,28 +1375,81 @@ def confirm_and_send(key, to_raw, subject, body, context="", reply_to_id=""):
 # ─────────────────────────────────────────────
 # 캘린더 · 화면 스타일
 # ─────────────────────────────────────────────
+ABLE_TEAL, ABLE_TEAL_DARK = "#0b9ea4", "#087e83"
+_LOGO_MASK = f"url('data:image/png;base64,{ABLE_LOGO_B64}') center/contain no-repeat"
 APP_CSS = [
-    ".able-hero {padding:18px 22px; border-radius:16px; margin-bottom:10px;"
-    " background:linear-gradient(135deg, rgba(62,123,250,.16), rgba(139,92,246,.12));"
-    " border:1px solid rgba(128,128,128,.2);}",
-    ".able-title {font-size:1.65rem; font-weight:700; line-height:1.3;}",
-    ".able-sub {opacity:.75; font-size:.9rem; margin:2px 0 10px;}",
-    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; margin:2px 6px 2px 0;"
-    " border-radius:999px; background:rgba(128,128,128,.16);}",
-    ".able-chip.warn {background:rgba(229,72,77,.2);}",
+    # 브랜드 색 (Streamlit 기본 빨강 → 에이블 청록)
+    f":root {{--able:{ABLE_TEAL}; --able-dark:{ABLE_TEAL_DARK}; --able-soft:rgba(11,158,164,.10);}}",
+    "button[kind='primary'], [data-testid='stBaseButton-primary'] {background:var(--able) !important;"
+    " border-color:var(--able) !important; color:#fff !important;}",
+    "button[kind='primary']:hover, [data-testid='stBaseButton-primary']:hover {background:var(--able-dark) !important;"
+    " border-color:var(--able-dark) !important;}",
+    "button[kind='secondary']:hover, [data-testid='stBaseButton-secondary']:hover {border-color:var(--able) !important;"
+    " color:var(--able-dark) !important;}",
+    "button:focus-visible {box-shadow:0 0 0 3px rgba(11,158,164,.35) !important;}",
+    "[data-baseweb='tab-highlight'] {background-color:var(--able) !important;}",
+    "[data-baseweb='tab'][aria-selected='true'] p {color:var(--able-dark) !important; font-weight:600;}",
+    "[data-baseweb='tab']:hover p {color:var(--able-dark) !important;}",
+    "label[data-baseweb='radio']:has(input:checked) > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input:checked) > span {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input[role='switch']:checked) > div {background-color:var(--able) !important;}",
+    # (새 버전 Streamlit 구조) 라디오·체크박스·토글
+    "[data-testid='stRadioOption'][data-selected='true'] > div > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-selected='true']:not([data-testid='stRadioOption']) > span + div {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "input:focus, textarea:focus, [data-baseweb='select'] > div:focus-within {border-color:var(--able) !important;}",
+    "a {color:var(--able-dark);}",
+    # 로고 마크 (로고 색을 그대로 씀)
+    f".able-mark {{display:inline-block; width:28px; height:28px; flex:0 0 auto; background:var(--able);"
+    f" -webkit-mask:{_LOGO_MASK}; mask:{_LOGO_MASK};}}",
+    ".able-mark.big {width:40px; height:40px;}",
+    ".able-side-brand {display:flex; align-items:center; gap:10px; margin:0 0 12px;}",
+    ".able-side-brand b {font-size:1.25rem;}",
+    # 헤더: 한 줄 (로고 · 제목/날짜 · 오늘 요약 칩)
+    ".able-hero {display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:12px 18px; border-radius:14px;"
+    " margin-bottom:6px; background:var(--able-soft); border:1px solid rgba(11,158,164,.22);}",
+    ".able-hero-text {flex:1 1 220px; min-width:0;}",
+    ".able-chips {display:flex; flex-wrap:wrap; gap:6px;}",
+    ".able-title {font-size:1.3rem; font-weight:700; line-height:1.25;}",
+    ".able-sub {opacity:.72; font-size:.85rem; margin-top:1px;}",
+    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; border-radius:999px;"
+    " background:rgba(128,128,128,.10); border:1px solid rgba(11,158,164,.25); white-space:nowrap;}",
+    ".able-chip.warn {background:rgba(229,72,77,.14); border-color:rgba(229,72,77,.35);}",
+    # 대시보드 오늘 요약 카드
+    ".able-cards {display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px; margin:4px 0 12px;}",
+    "@media (max-width:900px) {.able-cards {grid-template-columns:repeat(2, minmax(0,1fr));}}",
+    ".able-card {border:1px solid rgba(128,128,128,.22); border-left:4px solid var(--c, var(--able)); border-radius:10px;"
+    " padding:10px 12px; min-width:0; background:rgba(128,128,128,.04);}",
+    ".able-card .k {font-size:.76rem; opacity:.7; letter-spacing:.02em;}",
+    ".able-card .v {font-size:1.05rem; font-weight:700; margin-top:2px; overflow:hidden; text-overflow:ellipsis;"
+    " white-space:nowrap;}",
+    ".able-card .m {font-size:.8rem; opacity:.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}",
+    ".able-card .big {font-size:1.6rem; font-weight:700; line-height:1.15; font-variant-numeric:tabular-nums;}",
     ".able-badge {display:inline-block; padding:1px 8px; border-radius:999px; font-size:.72rem;"
     " font-weight:600; margin-right:4px; vertical-align:1px;}",
     ".able-meta {opacity:.75; font-size:.83rem;}",
     ".able-warn {color:#e5484d; font-size:.8rem;}",
-    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px;"
-    " border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
+    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.3; margin-top:3px; padding:2px 4px;"
+    " border-radius:4px;}",
+    ".able-cal .pill .tm {display:block; font-size:.64rem; opacity:.75; font-variant-numeric:tabular-nums;}",
+    ".able-cal .pill .t {display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;"
+    " word-break:keep-all; overflow-wrap:anywhere;}",
     ".able-cal .pill.done {text-decoration:line-through; opacity:.45;}",
     ".able-cal .more {font-size:.68rem; opacity:.6; margin-top:2px;}",
     ".legend {margin-top:4px;} .legend span {font-size:.74rem; margin-right:10px; white-space:nowrap;}",
     ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}",
-    ".cal-cell {height:58px; overflow:hidden; margin-top:-10px;}",
+    ".cal-cell {min-height:70px; overflow:hidden; margin-top:-12px; padding-bottom:4px;"
+    " border-bottom:1px solid rgba(128,128,128,.14);}",
     ".cal-cell.other {opacity:.35;}",
-    ".st-key-able_cal button {padding:0 4px; min-height:32px;}",
+    ".st-key-able_cal button {padding:0 4px; min-height:30px; justify-content:flex-start;}",
+    ".st-key-able_cal button[kind='secondary'], .st-key-able_cal [data-testid='stBaseButton-secondary'] {"
+    " background:transparent !important; border-color:transparent !important; box-shadow:none !important;}",
+    ".st-key-able_cal button[kind='secondary']:hover, .st-key-able_cal [data-testid='stBaseButton-secondary']:hover {"
+    " background:var(--able-soft) !important;}",
+    ".st-key-able_cal button p {font-weight:600; font-variant-numeric:tabular-nums;}",
     ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}",
     "[class*='st-key-act_'] {gap:.3rem;}",
     "[class*='st-key-act_'] button {min-height:28px; padding:2px 6px;}",
@@ -1436,10 +1489,16 @@ def items_by_date():
 
 
 def pill_html(kind, label, color):
-    t = html.escape(label)
+    # 시간(있으면)은 작은 글씨 한 줄, 제목은 두 줄까지 보여 줌 · 마우스를 올리면 전체 제목
+    tm, rest = "", label
+    m = re.match(r"^(\d{1,2}:\d{2})\s+(.*)$", label)
+    if m:
+        tm, rest = m.group(1), m.group(2)
+    full = html.escape(label)
     line = "solid" if kind == "event" else "dashed"            # 할 일 마감은 점선
-    return (f'<span class="pill {kind}" title="{t}" '
-            f'style="border-left:3px {line} {color}; background:{color}24">{t}</span>')
+    return (f'<span class="pill {kind}" title="{full}" '
+            f'style="border-left:3px {line} {color}; background:{color}24">'
+            + (f'<span class="tm">{tm}</span>' if tm else "") + f'<span class="t">{html.escape(rest)}</span></span>')
 
 
 def legend_html():
@@ -1792,6 +1851,43 @@ def render_calendar(year, month):
 
     st.markdown(legend_html(), unsafe_allow_html=True)
     st.caption("날짜를 누르면 그 날 일정을 보고 추가·수정·삭제할 수 있어요.")
+
+
+def dashboard_cards_html(undone, overdue, due_this_week, today_events):
+    # 대시보드 맨 위 '오늘 한눈에' 카드: 다음 일정 · 가장 급한 마감 · 남은 할 일 · 오늘 일정/충돌
+    now_hm = dt.datetime.now(KST).strftime("%H:%M")
+    upcoming = sorted([e for e in data["events"] if (d := parse_date(e["date"]))
+                       and (d > today or (d == today and (e["end"] or e["start"] or "23:59") >= now_hm))],
+                      key=lambda e: (e["date"], e["start"] or "00:00"))
+    dues = sorted([t for t in undone if parse_date(t["due"])], key=lambda t: (t["due"], PRIORITY_ORDER[t["priority"]]))
+    esc = html.escape
+
+    def card(key, value, meta, color, big=False):
+        v = f'<div class="big">{value}</div>' if big else f'<div class="v" title="{esc(value)}">{esc(value)}</div>'
+        return (f'<div class="able-card" style="--c:{color}"><div class="k">{key}</div>{v}'
+                f'<div class="m" title="{esc(meta)}">{esc(meta)}</div></div>')
+
+    if upcoming:
+        e = upcoming[0]
+        d = parse_date(e["date"])
+        when = ("오늘" if d == today else "내일" if (d - today).days == 1 else fmt_date(d)) + " " + event_time_text(e)
+        c1 = card("다음 일정", e["title"], when, ev_color(e))
+    else:
+        c1 = card("다음 일정", "예정된 일정 없음", "캘린더에서 날짜를 눌러 추가해요", "#94a3b8")
+    if dues:
+        t = dues[0]
+        d = parse_date(t["due"])
+        color = "#e5484d" if d <= today + dt.timedelta(days=1) else "#d97706" if (d - today).days <= 3 else "#2563eb"
+        c2 = card("가장 급한 마감", t["title"], f"{d_day(d)} · {fmt_date(d)} · {t['priority']}", color)
+    else:
+        c2 = card("가장 급한 마감", "마감 있는 할 일 없음", f"기한 없는 할 일 {len(undone)}건", "#94a3b8")
+    c3 = card("남은 할 일", f"{len(undone)}건",
+              (f"기한 지남 {len(overdue)}건 · " if overdue else "") + f"이번 주 마감 {len(due_this_week)}건",
+              "#e5484d" if overdue else ABLE_TEAL, big=True)
+    ov = count_overlaps()
+    c4 = card("오늘 일정", f"{len(today_events)}건", f"⚠️ 겹치는 일정 {ov}건" if ov else "겹치는 일정 없음",
+              "#e5484d" if ov else ABLE_TEAL, big=True)
+    return f'<div class="able-cards">{c1}{c2}{c3}{c4}</div>'
 
 
 def count_overlaps():
@@ -2268,6 +2364,68 @@ def render_pending_event():
 # 기존 "# 화면" 바로 위에 이 블록 전체 추가
 # ─────────────────────────────────────────────
 
+def render_leave_briefing_settings():
+    # 사이드바 ⚙️ 설정: 퇴근 브리핑 켜기·시간·미리보기·초기화 + 테스트 상태 (본문 첫 화면을 가리지 않게)
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    settings = st.session_state.data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+    now = briefing_dt.datetime.now(seoul)
+    current_iso = now.date().isoformat()
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+    try:
+        saved_time = briefing_dt.time.fromisoformat(settings["leave_briefing_time"])
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+    st.session_state.setdefault("lb_enabled_widget", settings["leave_briefing_enabled"])
+    st.session_state.setdefault("lb_time_widget", saved_time)
+
+    with st.expander("⚙️ 설정 · 퇴근 브리핑", expanded=False):
+        enabled = st.checkbox("퇴근 10분 전 내일 브리핑 받기", key="lb_enabled_widget")
+        leave_time = st.time_input("퇴근 시간 · 24시간 기준", key="lb_time_widget", step=60)
+        st.caption("오후 6시는 18:00이에요. 앱이 열려 있는 동안 30초마다 확인해요.")
+        left, right = st.columns(2)
+        preview_clicked = left.button("미리보기", key="lb_preview_button", use_container_width=True)
+        reset_clicked = right.button("초기화", key="lb_reset_button", use_container_width=True,
+                                     help="오늘 알림을 다시 받을 수 있게 해요")
+        show_test = st.toggle("🛠️ 테스트 상태 보기", key="lb_test_toggle")
+
+        leave_text = leave_time.strftime("%H:%M")
+        if (settings["leave_briefing_enabled"] != enabled or settings["leave_briefing_time"] != leave_text
+                or reset_clicked):
+            settings["leave_briefing_enabled"] = enabled
+            settings["leave_briefing_time"] = leave_text
+            settings["leave_briefing_ack_date"] = ""
+            st.session_state.pop("lb_toast_date", None)
+            save_data()
+        if preview_clicked:
+            st.session_state["lb_preview_date"] = current_iso
+
+        if show_test:
+            leave_at = briefing_dt.datetime.combine(now.date(), leave_time, tzinfo=seoul)
+            notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+            acknowledged = settings["leave_briefing_ack_date"] == current_iso
+            auto_show = enabled and now >= notification_at and not acknowledged
+            st.text(f"현재 한국 시간: {now:%Y-%m-%d %H:%M:%S}")
+            st.text(f"설정한 퇴근 시간: {leave_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 시작 시간: {notification_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 켜짐: {'예' if enabled else '아니요'}")
+            st.text(f"오늘 확인 완료: {'예' if acknowledged else '아니요'}")
+            st.text(f"자동 표시 조건 충족: {'예' if auto_show else '아니요'}")
+            if not enabled:
+                st.info("브리핑 받기를 켜주세요.")
+            elif acknowledged:
+                st.info("오늘 브리핑을 확인했어요. 다시 테스트하려면 '초기화'를 누르세요.")
+            elif now < notification_at:
+                minutes, seconds = divmod(int((notification_at - now).total_seconds()), 60)
+                st.info(f"알림 시작까지 {minutes}분 {seconds}초 남았어요.")
+            else:
+                st.success("자동 브리핑 표시 조건이 충족됐어요.")
+
+
 @st.fragment(run_every="30s")
 def render_leave_briefing():
     import datetime as briefing_dt
@@ -2302,113 +2460,15 @@ def render_leave_briefing():
     )
     st.session_state.setdefault("lb_time_widget", saved_time)
 
-    with st.expander("🌙 퇴근 전 내일 브리핑 설정", expanded=False):
-        enabled = st.checkbox(
-            "퇴근 10분 전 브리핑 받기",
-            key="lb_enabled_widget",
-        )
-
-        leave_time = st.time_input(
-            "퇴근 시간 · 24시간 기준",
-            key="lb_time_widget",
-            step=60,
-        )
-
-        st.caption(
-            "오후 1시 45분은 13:45, 오후 6시는 18:00입니다. "
-            "한국 시간 기준으로 확인해요."
-        )
-
-        left, right = st.columns(2)
-
-        preview_clicked = left.button(
-            "👀 미리보기",
-            key="lb_preview_button",
-            use_container_width=True,
-        )
-
-        reset_clicked = right.button(
-            "🔄 오늘 알림 초기화",
-            key="lb_reset_button",
-            use_container_width=True,
-        )
-
-        st.caption(
-            "앱이 열려 있는 동안 30초마다 확인해요. "
-            "앱을 닫으면 알림이 작동하지 않아요."
-        )
-
+    # 설정 값은 사이드바 ⚙️ 설정(render_leave_briefing_settings)에서 바꾸고, 여기서는 읽기만 함
+    enabled = bool(settings["leave_briefing_enabled"])
+    leave_time = saved_time
     leave_text = leave_time.strftime("%H:%M")
-
-    settings_changed = (
-        settings["leave_briefing_enabled"] != enabled
-        or settings["leave_briefing_time"] != leave_text
-    )
-
-    # 설정 변경 또는 초기화 시 오늘 알림을 다시 받을 수 있게 처리
-    if settings_changed or reset_clicked:
-        settings["leave_briefing_enabled"] = enabled
-        settings["leave_briefing_time"] = leave_text
-        settings["leave_briefing_ack_date"] = ""
-
-        st.session_state.pop("lb_toast_date", None)
-        save_data()
-
-    leave_at = briefing_dt.datetime.combine(
-        current_date,
-        leave_time,
-        tzinfo=seoul,
-    )
+    leave_at = briefing_dt.datetime.combine(current_date, leave_time, tzinfo=seoul)
     notification_at = leave_at - briefing_dt.timedelta(minutes=10)
-
-    # 반드시 초기화 처리 이후에 확인 완료 여부 계산
-    acknowledged = (
-        settings["leave_briefing_ack_date"] == current_iso
-    )
-
-    auto_show = (
-        enabled
-        and now >= notification_at
-        and not acknowledged
-    )
-
-    if preview_clicked:
-        st.session_state["lb_preview_date"] = current_iso
-
-    preview_show = (
-        st.session_state.get("lb_preview_date") == current_iso
-    )
-
-    with st.expander("🛠️ 테스트 상태 보기", expanded=False):
-        st.text(f"현재 한국 시간: {now:%Y-%m-%d %H:%M:%S}")
-        st.text(f"설정한 퇴근 시간: {leave_at:%Y-%m-%d %H:%M}")
-        st.text(f"알림 시작 시간: {notification_at:%Y-%m-%d %H:%M}")
-        st.text(f"알림 켜짐: {'예' if enabled else '아니요'}")
-        st.text(f"오늘 확인 완료: {'예' if acknowledged else '아니요'}")
-        st.text(f"자동 표시 조건 충족: {'예' if auto_show else '아니요'}")
-
-        if not enabled:
-            st.info("브리핑 받기를 켜주세요.")
-        elif acknowledged:
-            st.info(
-                "오늘 브리핑을 확인했어요. "
-                "다시 테스트하려면 ‘오늘 알림 초기화’를 누르세요."
-            )
-        elif now < notification_at:
-            remaining = int(
-                (notification_at - now).total_seconds()
-            )
-            minutes, seconds = divmod(remaining, 60)
-            st.info(
-                f"알림 시작까지 {minutes}분 {seconds}초 남았어요."
-            )
-        else:
-            st.success("자동 브리핑 표시 조건이 충족됐어요.")
-
-        st.caption(
-            "시간은 마지막 확인 시점 기준이에요. "
-            "내일은 주말·공휴일을 포함한 다음 날짜입니다."
-        )
+    acknowledged = settings["leave_briefing_ack_date"] == current_iso
+    auto_show = enabled and now >= notification_at and not acknowledged
+    preview_show = st.session_state.get("lb_preview_date") == current_iso
 
     if not (auto_show or preview_show):
         return
@@ -2571,8 +2631,10 @@ def render_leave_briefing():
         )
 
 
-# 호출문까지 함께 추가하세요.
-render_leave_briefing()
+SIDE_MAIN = st.sidebar.container()          # 사이드바 위쪽: 새 채팅·대화 기록·요약
+SIDE_SETTINGS = st.sidebar.container()      # 사이드바 맨 아래: ⚙️ 설정
+with SIDE_SETTINGS:
+    render_leave_briefing_settings()
 
 # ─────────────────────────────────────────────
 # 화면
@@ -2591,10 +2653,13 @@ _ov = count_overlaps()
 if _ov:
     _chip_html += f'<span class="able-chip warn">충돌 일정 {_ov}건</span>'
 st.markdown(
-    f'<div class="able-hero"><div class="able-title">🤖 AI 개인비서 에이블</div>'
-    f'<div class="able-sub">김 대리님의 업무를 돕는 음성 AI 비서 · {today.year}년 {today.month}월 {today.day}일 '
-    f'{WEEKDAYS[today.weekday()]}요일</div>{_chip_html}</div>',
+    f'<div class="able-hero"><span class="able-mark big"></span>'
+    f'<div class="able-hero-text"><div class="able-title">AI 개인비서 에이블</div>'
+    f'<div class="able-sub">{today.month}월 {today.day}일 {WEEKDAYS[today.weekday()]}요일 · 김 대리님의 업무 비서</div></div>'
+    f'<div class="able-chips">{_chip_html}</div></div>',
     unsafe_allow_html=True)
+
+render_leave_briefing()      # 퇴근 10분 전(또는 미리보기)에만 헤더 아래에 내일 브리핑 카드가 나타남
 
 render_pending_event()
 render_pending_delete()
@@ -2609,11 +2674,7 @@ with tab_dash:
     overdue = [t for t in undone if (d := parse_date(t["due"])) and d < today]
     today_events = [e for e in data["events"] if parse_date(e["date"]) == today]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("오늘 일정", f"{len(today_events)}건")
-    c2.metric("남은 할 일", f"{len(undone)}건",
-              delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
-    c3.metric("이번 주 마감", f"{len(due_this_week)}건")
+    st.markdown(dashboard_cards_html(undone, overdue, due_this_week, today_events), unsafe_allow_html=True)
 
     with st.expander("⚙️ 일정 종류 · 할 일 분류 직접 정하기"):
         render_type_settings()
@@ -3320,10 +3381,9 @@ with tab_chat:
     chat = current_chat()
     turns = chat["turns"] if chat else []
 
-    h1, h2, h3 = st.columns([5, 1.3, 1.3])
+    h1, h3 = st.columns([6, 1.3])
     h1.markdown(f"#### 💬 {chat['title'] if chat else '새 채팅'}")
-    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 대화 기록은 왼쪽 사이드바에 있어요")
-    h2.button("➕ 새 채팅", key="new_chat_main", on_click=new_chat_cb, use_container_width=True)
+    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 새 채팅과 대화 기록은 왼쪽 사이드바에 있어요")
     h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
                        mime="text/plain", use_container_width=True, disabled=not turns)
 
@@ -4312,12 +4372,13 @@ with tab_mail:
 # ─────────────────────────────────────────────
 # 사이드바 (챕터를 누르면 펼쳐짐)
 # ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🤖 에이블")
-    st.caption("김 대리님의 AI 개인비서")
+with SIDE_MAIN:
+    st.markdown(f'<div class="able-side-brand"><span class="able-mark"></span><div><b>에이블</b>'
+                f'<div class="able-meta">김 대리님의 AI 개인비서</div></div></div>', unsafe_allow_html=True)
 
     # 0) GPT처럼 새 채팅 + 대화 기록
-    st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
+    st.button("새 채팅", key="new_chat_side", icon=":material/add:", on_click=new_chat_cb, type="primary",
+              use_container_width=True)
     chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
     with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
         if not chats:
