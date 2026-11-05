@@ -1938,7 +1938,7 @@ def render_pending_event():
         b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
         '''
 
-        def render_pending_event():
+def render_pending_event():
     from datetime import datetime
 
     p = st.session_state.get("pending_event")
