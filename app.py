@@ -143,7 +143,8 @@ def normalize_note(n):
             t.setdefault(k, v)
     for sc in n["schedules"]:
         for k, v in {"title": "", "when_text": "", "date_type": "none", "date": "", "evidence": "",
-                     "verified": True}.items():
+                     "verified": True, "kind": "기타", "end_date": "", "start": "", "end": "", "place": "",
+                     "kim_attends": False, "cal_status": "reference", "event_ids": [], "conflicts": []}.items():
             sc.setdefault(k, v)
     return n
 
@@ -1066,12 +1067,86 @@ def apply_kim_tasks(tasks, source_text, source_label):
                 detail += f" / 요청: {t['requester']}"
             if t["due_text"] and not exact:
                 detail += f" / 기한(대략): {t['due_text']}"
+            elif t["due_text"] and re.search(r"\d+\s*시|오전|오후", t["due_text"]):
+                detail += f" / 마감: {t['due_text']}"
             item = add_todo(title, t["due_date"] if exact else "", t["priority"], detail.strip(" /"), source_label)
             undone_titles[title] = item["id"]
             t.update(status="calendar" if exact else ("approximate" if t["due_type"] == "approximate" else "nodue"),
                      todo_id=item["id"])
         out.append(t)
     return out
+
+
+MEETING_WORDS = re.compile(r"회의|미팅|상담|면담|방문|워크숍|세미나|간담회|참석")
+WORK_WORDS = re.compile(r"자료|보고서|문서|작성|준비|정리|초안|조사|분석|제출|검토|확인|공유|전달")
+
+
+def split_meeting_tasks(tasks):
+    # AI가 '회의 참석'을 김 대리 업무로 넣은 경우 → 할 일이 아니라 일정으로 옮김
+    work, meetings = [], []
+    for t in tasks:
+        if MEETING_WORDS.search(t["title"]) and not WORK_WORDS.search(t["title"]):
+            meetings.append({"title": re.sub(r"\s*참석$", "", t["title"]).strip(), "kind": "회의·미팅",
+                             "when_text": t["due_text"], "date_type": t["due_type"], "date": t["due_date"],
+                             "end_date": "", "start": "", "end": "", "place": "", "kim_attends": True,
+                             "evidence": t["evidence"]})
+        else:
+            work.append(t)
+    return work, meetings
+
+
+def same_event(e, title, date, start):
+    # 이미 캘린더에 있는 같은 일정인지 (제목이 비슷하고 날짜가 같으면, 시간이 있으면 시간도 같으면)
+    if e["date"] != date or (start and e["start"] and e["start"] != start):
+        return False
+    a, b = _squash(e["title"]), _squash(title)
+    return a == b or (min(len(a), len(b)) >= 3 and (a in b or b in a))
+
+
+def apply_meeting_schedules(schedules, source_text, note_title):
+    # 회의에서 언급된 일정을 캘린더에 반영
+    #   · 회의·미팅(김 대리 참석)과 회사 행사 → 캘린더 일정으로 자동 등록 (기간 행사는 시작일·종료일)
+    #   · 다른 사람 마감, 날짜가 정확하지 않은 일정, 근거가 원문에 없는 일정 → 회의록에서 참고로만 보여 줌
+    #   · 기존 일정과 겹쳐도 회의 내용 그대로 등록하고, 겹친다는 표시만 남김 (임의로 옮기거나 지우지 않음)
+    out = []
+    for s in schedules:
+        s = dict(s, verified=found_in(s["evidence"], source_text), event_ids=[], conflicts=[])
+        d = parse_date(s["date"]) if s["date_type"] == "exact" else None
+        wanted = (s["kind"] == "회의·미팅" and s["kim_attends"]) or s["kind"] == "회사 행사"
+        if not s["verified"]:
+            s["cal_status"] = "unverified"
+        elif not d or not wanted:
+            s["cal_status"] = "reference"
+        else:
+            days = [(d.isoformat(), s["title"], s["start"], s["end"])]
+            end_d = parse_date(s["end_date"])
+            if s["kind"] == "회사 행사" and end_d and end_d > d:
+                days = [(d.isoformat(), f"{s['title']} 시작 (~{fmt_date(end_d)})", "", ""),
+                        (end_d.isoformat(), f"{s['title']} 종료", "", "")]
+            status = "calendar"
+            for date_iso, title, start, end in days:
+                dup = next((e for e in data["events"] if same_event(e, title, date_iso, start)), None)
+                if dup:
+                    s["event_ids"].append(dup["id"])
+                    status = "duplicate" if status == "calendar" and len(days) == 1 else status
+                    continue
+                note = f"[회의: {note_title}]" + (f" 장소: {s['place']}" if s["place"] else "")
+                f = build_event(title, date_iso, start, end, "", note)
+                s["conflicts"] += [conflict_text(c) for c in find_conflicts(f["date"], f["start"], f["end"])]
+                s["event_ids"].append(commit_event(f, "add", None, "회의 분석")["id"])
+            s["cal_status"] = "conflict" if s["conflicts"] else status
+        out.append(s)
+    return out
+
+
+def schedule_status_line(s):
+    return {
+        "calendar": "📅 캘린더에 일정으로 추가했어요",
+        "conflict": "⚠️ 캘린더에 추가했어요 · 겹치는 일정: " + ", ".join(s.get("conflicts", [])),
+        "duplicate": "↔️ 이미 캘린더에 있는 일정이에요",
+        "reference": "참고용 · 캘린더에는 넣지 않았어요",
+        "unverified": "⚠️ 원문에서 근거 문장을 찾지 못해 캘린더에 넣지 않았어요",
+    }.get(s.get("cal_status"), "")
 
 
 def task_status_line(t):
@@ -2189,7 +2264,7 @@ def render_pending_event():
 
 # ─────────────────────────────────────────────
 # 퇴근 10분 전 내일 브리핑
-# 이 블록 전체를 기존 "# 화면" 바로 위에 추가
+# 기존 "# 화면" 바로 위에 이 블록 전체 추가
 # ─────────────────────────────────────────────
 
 @st.fragment(run_every="30s")
@@ -2197,7 +2272,6 @@ def render_leave_briefing():
     import datetime as briefing_dt
     from zoneinfo import ZoneInfo
 
-    # 기존 앱 데이터 구조 사용
     app_data = st.session_state.data
     settings = app_data.setdefault("settings", {})
     seoul = ZoneInfo("Asia/Seoul")
@@ -2205,12 +2279,11 @@ def render_leave_briefing():
     now = briefing_dt.datetime.now(seoul)
     current_date = now.date()
     next_date = current_date + briefing_dt.timedelta(days=1)
+
     current_iso = current_date.isoformat()
     next_iso = next_date.isoformat()
-
     weekdays = ["월", "화", "수", "목", "금", "토", "일"]
 
-    # 기존 설정과 충돌하지 않도록 전용 키 사용
     settings.setdefault("leave_briefing_enabled", True)
     settings.setdefault("leave_briefing_time", "18:00")
     settings.setdefault("leave_briefing_ack_date", "")
@@ -2222,15 +2295,11 @@ def render_leave_briefing():
     except (TypeError, ValueError):
         saved_time = briefing_dt.time(18, 0)
 
-    # 위젯이 화면에서 사라졌다가 다시 생겨도 저장값 복원
     st.session_state.setdefault(
         "lb_enabled_widget",
         settings["leave_briefing_enabled"],
     )
-    st.session_state.setdefault(
-        "lb_time_widget",
-        saved_time,
-    )
+    st.session_state.setdefault("lb_time_widget", saved_time)
 
     with st.expander("🌙 퇴근 전 내일 브리핑 설정", expanded=False):
         enabled = st.checkbox(
@@ -2239,31 +2308,49 @@ def render_leave_briefing():
         )
 
         leave_time = st.time_input(
-            "퇴근 시간",
+            "퇴근 시간 · 24시간 기준",
             key="lb_time_widget",
-            step=300,
+            step=60,
         )
 
         st.caption(
-            "한국 시간 기준 · 앱이 열려 있는 동안 30초마다 확인해요. "
-            "내일은 주말·공휴일을 포함한 다음 날짜예요."
+            "오후 1시 45분은 13:45, 오후 6시는 18:00입니다. "
+            "한국 시간 기준으로 확인해요."
         )
 
-        preview_clicked = st.button(
-            "👀 내일 브리핑 미리보기",
+        left, right = st.columns(2)
+
+        preview_clicked = left.button(
+            "👀 미리보기",
             key="lb_preview_button",
             use_container_width=True,
         )
 
-    # 설정이 변경된 경우에만 기존 저장 함수 호출
+        reset_clicked = right.button(
+            "🔄 오늘 알림 초기화",
+            key="lb_reset_button",
+            use_container_width=True,
+        )
+
+        st.caption(
+            "앱이 열려 있는 동안 30초마다 확인해요. "
+            "앱을 닫으면 알림이 작동하지 않아요."
+        )
+
     leave_text = leave_time.strftime("%H:%M")
 
-    if (
+    settings_changed = (
         settings["leave_briefing_enabled"] != enabled
         or settings["leave_briefing_time"] != leave_text
-    ):
+    )
+
+    # 설정 변경 또는 초기화 시 오늘 알림을 다시 받을 수 있게 처리
+    if settings_changed or reset_clicked:
         settings["leave_briefing_enabled"] = enabled
         settings["leave_briefing_time"] = leave_text
+        settings["leave_briefing_ack_date"] = ""
+
+        st.session_state.pop("lb_toast_date", None)
         save_data()
 
     leave_at = briefing_dt.datetime.combine(
@@ -2273,11 +2360,11 @@ def render_leave_briefing():
     )
     notification_at = leave_at - briefing_dt.timedelta(minutes=10)
 
+    # 반드시 초기화 처리 이후에 확인 완료 여부 계산
     acknowledged = (
         settings["leave_briefing_ack_date"] == current_iso
     )
 
-    # 알림 시작 이후, 확인할 때까지 당일 표시
     auto_show = (
         enabled
         and now >= notification_at
@@ -2291,10 +2378,40 @@ def render_leave_briefing():
         st.session_state.get("lb_preview_date") == current_iso
     )
 
+    with st.expander("🛠️ 테스트 상태 보기", expanded=False):
+        st.text(f"현재 한국 시간: {now:%Y-%m-%d %H:%M:%S}")
+        st.text(f"설정한 퇴근 시간: {leave_at:%Y-%m-%d %H:%M}")
+        st.text(f"알림 시작 시간: {notification_at:%Y-%m-%d %H:%M}")
+        st.text(f"알림 켜짐: {'예' if enabled else '아니요'}")
+        st.text(f"오늘 확인 완료: {'예' if acknowledged else '아니요'}")
+        st.text(f"자동 표시 조건 충족: {'예' if auto_show else '아니요'}")
+
+        if not enabled:
+            st.info("브리핑 받기를 켜주세요.")
+        elif acknowledged:
+            st.info(
+                "오늘 브리핑을 확인했어요. "
+                "다시 테스트하려면 ‘오늘 알림 초기화’를 누르세요."
+            )
+        elif now < notification_at:
+            remaining = int(
+                (notification_at - now).total_seconds()
+            )
+            minutes, seconds = divmod(remaining, 60)
+            st.info(
+                f"알림 시작까지 {minutes}분 {seconds}초 남았어요."
+            )
+        else:
+            st.success("자동 브리핑 표시 조건이 충족됐어요.")
+
+        st.caption(
+            "시간은 마지막 확인 시점 기준이에요. "
+            "내일은 주말·공휴일을 포함한 다음 날짜입니다."
+        )
+
     if not (auto_show or preview_show):
         return
 
-    # 자동 알림 토스트: 현재 세션에서 하루 한 번
     if (
         auto_show
         and st.session_state.get("lb_toast_date") != current_iso
@@ -2305,7 +2422,7 @@ def render_leave_briefing():
         )
         st.session_state["lb_toast_date"] = current_iso
 
-    # 일정: date / start / end / category / note
+    # 기존 일정 데이터 사용
     next_events = sorted(
         [
             event
@@ -2315,7 +2432,7 @@ def render_leave_briefing():
         key=lambda event: event.get("start") or "00:00",
     )
 
-    # 할 일: due / done / priority / detail
+    # 기존 할 일 데이터 사용: 마감일 due, 완료 여부 done
     next_todos = sorted(
         [
             todo
@@ -2329,8 +2446,7 @@ def render_leave_briefing():
         ),
     )
 
-    # 기존 앱의 충돌 판단 기준 재사용
-    # 실제 시간 겹침뿐 아니라 앞뒤 여유 부족도 포함
+    # 기존 앱의 시간 겹침·간격 부족 판단 로직 사용
     conflict_pairs = []
 
     for index, first in enumerate(next_events):
@@ -2366,11 +2482,8 @@ def render_leave_briefing():
 
         st.markdown("**📅 내일 일정**")
 
-        if not next_events:
-            st.caption("내일 등록된 일정이 없어요.")
-        else:
+        if next_events:
             for event in next_events:
-                # 기존 시간 표시 함수 사용: 종일 일정도 처리
                 st.text(
                     f"• {event_time_text(event)} | "
                     f"{event.get('title', '제목 없음')}"
@@ -2386,12 +2499,12 @@ def render_leave_briefing():
                         f"📝 {event.get('title', '일정')} 메모"
                     ):
                         st.text(note)
+        else:
+            st.caption("내일 등록된 일정이 없어요.")
 
         st.markdown("**⏰ 내일 마감인 미완료 업무**")
 
-        if not next_todos:
-            st.caption("내일 마감인 미완료 업무가 없어요.")
-        else:
+        if next_todos:
             for todo in next_todos:
                 priority = todo.get("priority", "보통")
 
@@ -2408,9 +2521,11 @@ def render_leave_briefing():
                         st.text(detail)
 
             st.caption(
-                "현재 할 일에는 마감 날짜만 저장되어 있어요. "
+                "할 일에는 마감 날짜만 저장되어 있어요. "
                 "구체적인 마감 시간은 업무 상세 내용을 확인해 주세요."
             )
+        else:
+            st.caption("내일 마감인 미완료 업무가 없어요.")
 
         if conflict_pairs:
             st.warning(
@@ -2435,8 +2550,10 @@ def render_leave_briefing():
         st.divider()
 
         def acknowledge_briefing():
-            # 클릭 시점의 한국 날짜 사용
-            ack_date = briefing_dt.datetime.now(seoul).date().isoformat()
+            ack_date = (
+                briefing_dt.datetime.now(seoul).date().isoformat()
+            )
+
             st.session_state.data["settings"][
                 "leave_briefing_ack_date"
             ] = ack_date
@@ -2453,7 +2570,7 @@ def render_leave_briefing():
         )
 
 
-# 반드시 함수 정의 바로 아래에 함께 추가
+# 호출문까지 함께 추가하세요.
 render_leave_briefing()
 
 # ─────────────────────────────────────────────
@@ -3315,16 +3432,26 @@ with tab_chat:
 # ─────────────────────────────────────────────
 # 🎙️ 회의 분석 (실시간 녹음 · 음성 파일 · 텍스트 파일)
 # ─────────────────────────────────────────────
+SCHEDULE_KINDS = ["회의·미팅", "회사 행사", "다른 사람 마감", "기타"]
 SCHEDULE_ITEM = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "description": "일정 이름 (예: B사 제휴 미팅, 중간 점검 회의, 연말 프로모션)"},
+        "kind": {"type": "string", "enum": SCHEDULE_KINDS,
+                 "description": "회의·미팅: 회의·미팅·상담·방문·면담 / 회사 행사: 프로모션·출시·행사 기간 / "
+                                "다른 사람 마감: 김 대리가 아닌 사람의 업무 마감 / 기타"},
         "when_text": {"type": "string", "description": "시점 표현 원문 그대로"},
         "date_type": {"type": "string", "enum": ["exact", "approximate", "none"]},
-        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
+        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD(기간이면 시작일), 아니면 빈 문자열"},
+        "end_date": {"type": "string", "description": "기간 일정의 마지막 날 YYYY-MM-DD, 하루짜리면 빈 문자열"},
+        "start": {"type": "string", "description": "시작 시간 HH:MM(24시간), 언급 없으면 빈 문자열"},
+        "end": {"type": "string", "description": "끝나는 시간 HH:MM, 언급 없으면 빈 문자열"},
+        "place": {"type": "string", "description": "장소, 언급 없으면 빈 문자열"},
+        "kim_attends": {"type": "boolean", "description": "김 대리가 참석자로 언급되었으면 true"},
         "evidence": {"type": "string", "description": "원문에서 그대로 복사한 근거 문장 1개"},
     },
-    "required": ["title", "when_text", "date_type", "date", "evidence"],
+    "required": ["title", "kind", "when_text", "date_type", "date", "end_date", "start", "end", "place",
+                 "kim_attends", "evidence"],
     "additionalProperties": False,
 }
 
@@ -3336,7 +3463,7 @@ MEETING_SCHEMA = {
         "decisions": {"type": "array", "items": {"type": "string"}, "description": "회의에서 확정된 사항"},
         "kim_tasks": {"type": "array", "items": TASK_ITEM},
         "schedules": {"type": "array", "items": SCHEDULE_ITEM,
-                      "description": "김 대리 업무가 아닌, 회의에서 언급된 일정(출시, 광고 시작, 다음 회의 등)"},
+                      "description": "회의에서 언급된 일정(회의·미팅, 프로모션·출시 기간, 다른 사람 마감 등)"},
     },
     "required": ["title_guess", "summary", "decisions", "kim_tasks", "schedules"],
     "additionalProperties": False,
@@ -3353,7 +3480,13 @@ def analyze_meeting(text, title="", attendees=""):
         "[작성 규칙]",
         *TASK_RULES,
         "- summary: 안건별 핵심을 3~6개 문장으로. decisions: 회의에서 확정된 사항만.",
-        "- schedules: 김 대리 업무가 아닌 일정만. when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게.",
+        "- kim_tasks에는 김 대리가 해야 할 '작업'(문서·보고서 작성, 자료 준비, 조사, 메일 확인 등)만 넣습니다.",
+        "  회의·미팅·상담 '참석'은 kim_tasks가 아니라 schedules에 넣습니다.",
+        "- schedules: 회의에서 언급된 일정. 회의·미팅·상담·방문은 kind='회의·미팅', 프로모션·출시·행사 기간은 '회사 행사',",
+        "  김 대리가 아닌 사람의 업무 마감은 '다른 사람 마감'. 김 대리 업무의 마감은 kim_tasks에 있으므로 넣지 않습니다.",
+        "  when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게. 기간이면 date=시작일, end_date=마지막 날.",
+        "  start/end는 원문에 시간이 있을 때만 HH:MM. kim_attends는 김 대리가 참석자로 언급됐을 때만 true.",
+        "  이미 잡혀 있는 기존 일정이 언급되어도(예: 김 대리 캘린더에 있는 상담) 그대로 schedules에 넣습니다.",
     ])
     resp = get_client().responses.create(
         model=MODEL, instructions=instructions,
@@ -3379,15 +3512,16 @@ def note_markdown(n):
             lines.append(f"  - {t['detail']}")
     if not n["kim_tasks"]:
         lines.append("- (없음)")
-    lines += ["", "## 회의에서 언급된 일정 (참고)"]
+    lines += ["", "## 회의에서 언급된 일정"]
     lines += [f"- {s['title']}: {s['when_text'] or '시점 언급 없음'}" for s in n["schedules"]] or ["- (없음)"]
     return "\n".join(lines)
 
 
 with tab_meet:
-    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고 **김 대리 업무만** 할 일에 올립니다.")
-    st.caption("📅 정확한 날짜가 있는 김 대리 업무만 캘린더에 들어갑니다. 대략적인 기한이나 다른 일정은 이 화면에서만 보여 드려요. "
-               "원문에서 근거를 찾지 못한 내용은 추가하지 않습니다.")
+    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고, 분석이 끝나면 **자동으로** "
+                "문서 작성·보고서 제출 같은 **김 대리 업무는 할 일**로, **회의·미팅은 캘린더 일정**으로 등록합니다.")
+    st.caption("📅 정확한 날짜가 있는 할 일은 마감일로 캘린더에 표시되고, 김 대리가 참석하는 회의·미팅과 회사 행사(프로모션 기간 등)는 "
+               "일정으로 들어갑니다. 다른 사람의 마감, 날짜가 정확하지 않은 일정, 원문에서 근거를 찾지 못한 내용은 참고로만 보여 드려요.")
 
     with st.container(border=True):
         mode = st.radio("분석 방법", ["🎙️ 실시간 녹음", "📁 음성 파일 분석", "📄 텍스트 파일 분석"],
@@ -3438,12 +3572,14 @@ with tab_meet:
                     text = src_text
                 st.write("② 회의 내용 분석 중")
                 res = analyze_meeting(text, m_title, m_people)
-                st.write("③ 김 대리 업무를 할 일·캘린더에 반영 중")
-                tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 분석")
-                schedules = [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]]
+                st.write("③ 할 일(문서·보고서 등)은 대시보드에, 회의·미팅은 캘린더 일정으로 반영 중")
+                note_title = m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의"
+                work, meet_like = split_meeting_tasks(res["kim_tasks"])
+                tasks = apply_kim_tasks(work, text, "회의 분석")
+                schedules = apply_meeting_schedules(res["schedules"] + meet_like, text, note_title)
                 note = {
                     "id": uuid.uuid4().hex[:8],
-                    "title": m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의",
+                    "title": note_title,
                     "when": now_kst(), "attendees": m_people.strip(),
                     "source": ("실시간 녹음" if mode.startswith("🎙") else "음성 파일") if src_audio else "텍스트 파일",
                     "text": text, "summary": res["summary"], "decisions": res["decisions"],
@@ -3454,6 +3590,8 @@ with tab_meet:
                 save_data()
                 n_cal = sum(t["status"] == "calendar" for t in tasks)
                 n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
+                n_ev = sum(s["cal_status"] in ("calendar", "conflict") for s in schedules)
+                n_cf = sum(s["cal_status"] == "conflict" for s in schedules)
                 status.update(label="분석 완료!", state="complete")
                 done = True
             except Exception as e:
@@ -3461,7 +3599,8 @@ with tab_meet:
                 st.error(f"오류 내용: {e}")
         if done:
             st.session_state.meet_view = note["id"]
-            st.session_state.pending_toast = f"김 대리 업무 {n_add}건을 할 일에 추가했어요 (캘린더 {n_cal}건)."
+            st.session_state.pending_toast = (f"할 일 {n_add}건(마감 표시 {n_cal}건)과 일정 {n_ev}건을 캘린더에 추가했어요."
+                                              + (f" ⚠️ 겹치는 일정 {n_cf}건은 회의록에서 확인하세요." if n_cf else ""))
             st.rerun()
 
     notes = data["meeting_notes"]
@@ -3501,14 +3640,22 @@ with tab_meet:
             st.markdown("\n".join(f"- {s}" for s in n["decisions"]) or "_(확정된 사항이 없습니다)_")
         with r:
             st.markdown("#### 🗓️ 회의에서 언급된 일정")
-            st.caption("참고용입니다. 캘린더에는 넣지 않았어요.")
             if not n["schedules"]:
                 st.caption("언급된 일정이 없습니다.")
-            for s in n["schedules"]:
+            order = {"conflict": 0, "calendar": 1, "duplicate": 2, "reference": 3, "unverified": 4}
+            for s in sorted(n["schedules"], key=lambda x: (order.get(x.get("cal_status"), 3), x["date"] or "9999")):
                 when = s["when_text"] or "시점 언급 없음"
                 if s["date_type"] == "exact" and parse_date(s["date"]):
-                    when += f" ({fmt_date(parse_date(s['date']))})"
-                st.markdown(f"- **{s['title']}** · {when}" + ("" if s.get("verified", True) else " ⚠️근거 확인 필요"))
+                    when = fmt_date(parse_date(s["date"]))
+                    if parse_date(s.get("end_date")):
+                        when += f" ~ {fmt_date(parse_date(s['end_date']))}"
+                    if s.get("start"):
+                        when += f" {s['start']}" + (f"–{s['end']}" if s.get("end") else "")
+                st.markdown(f"**{s['title']}** · {when}" + (f" · {s['place']}" if s.get("place") else "")
+                            + f"  \n:gray[{s.get('kind', '기타')}]")
+                line = schedule_status_line(s)
+                {"calendar": st.success, "conflict": st.warning, "unverified": st.warning}.get(
+                    s.get("cal_status"), st.caption)(line)
 
         st.markdown(f"#### 🙋 김 대리 업무 ({len(n['kim_tasks'])}건)")
         if not n["kim_tasks"]:
@@ -3561,34 +3708,39 @@ with tab_meet:
         if st.session_state.get("meeting_delete_pending") == n["id"]:
             linked_ids = {t.get("todo_id") for t in n["kim_tasks"] if t.get("todo_id")}
             linked_count = sum(t["id"] in linked_ids for t in data["todos"])
+            linked_ev = {i for s in n["schedules"] if s.get("cal_status") in ("calendar", "conflict")
+                         for i in s.get("event_ids", [])}
+            linked_ev_count = sum(e["id"] in linked_ev for e in data["events"])
             with st.container(border=True):
                 st.markdown("#### 🗑️ 삭제할 범위를 선택해 주세요")
                 scope = st.radio(
                     "삭제 범위",
-                    ["회의록만 삭제", "회의록과 연결된 할 일도 삭제"],
+                    ["회의록만 삭제", "회의록과 연결된 할 일·일정도 삭제"],
                     index=0,
                     key=f"meeting_delete_scope_{n['id']}",
                 )
                 if scope == "회의록만 삭제":
                     st.info("회의 원문과 요약을 삭제합니다. 연결된 할 일과 캘린더 마감 표시는 유지됩니다.")
                 else:
-                    st.warning(f"회의록과 연결된 할 일 {linked_count}건을 함께 삭제합니다. "
-                               "해당 할 일의 캘린더 마감 표시도 사라집니다. 별도로 등록한 일정은 유지됩니다.")
+                    st.warning(f"회의록과 연결된 할 일 {linked_count}건, 이 회의 분석으로 추가한 일정 {linked_ev_count}건을 "
+                               "함께 삭제합니다. 원래 캘린더에 있던 일정과 직접 등록한 일정은 유지됩니다.")
                 cancel_col, confirm_col = st.columns(2)
                 if cancel_col.button("취소", key=f"meeting_delete_cancel_{n['id']}", use_container_width=True):
                     st.session_state.pop("meeting_delete_pending", None)
                     st.rerun()
                 if confirm_col.button("선택한 항목 삭제", key=f"meeting_delete_confirm_{n['id']}",
                                       type="primary", use_container_width=True):
-                    delete_tasks = scope == "회의록과 연결된 할 일도 삭제"
+                    delete_tasks = scope == "회의록과 연결된 할 일·일정도 삭제"
                     if delete_tasks:
                         data["todos"] = [t for t in data["todos"] if t["id"] not in linked_ids]
+                        data["events"] = [e for e in data["events"]
+                                          if not (e["id"] in linked_ev and e.get("source") == "회의 분석")]
                     data["meeting_notes"] = [item for item in data["meeting_notes"] if item["id"] != n["id"]]
                     save_data()
                     st.session_state.pop("meeting_delete_pending", None)
                     st.session_state.pop("meet_view", None)
                     st.session_state.pending_toast = (
-                        f"회의록과 연결된 할 일 {linked_count}건을 삭제했어요."
+                        f"회의록과 연결된 할 일 {linked_count}건, 일정 {linked_ev_count}건을 삭제했어요."
                         if delete_tasks else "회의록만 삭제했어요. 할 일과 캘린더 마감 표시는 유지했어요."
                     )
                     st.rerun()
