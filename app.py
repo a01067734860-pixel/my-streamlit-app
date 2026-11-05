@@ -1903,8 +1903,7 @@ def _decide_cb(choice):
                                           else f"'{r['title']}' 일정을 {r['date']} {r['time']}에 등록했어요.")
     else:
         st.session_state.pending_toast = f"⚠️ {r['error']}"
-
-'''
+"""
 def render_pending_event():
     # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
     p = st.session_state.get("pending_event")
@@ -1936,10 +1935,28 @@ def render_pending_event():
         a, b, _ = st.columns([1.4, 1, 3])
         a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
         b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
-        '''
+    """
 
 def render_pending_event():
-    from datetime import datetime
+    from datetime import datetime, date, time
+
+    # 날짜·시간 비교용 변환 함수
+    def to_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+
+        return date.fromisoformat(str(value).strip()[:10])
+
+    def to_time(value):
+        if isinstance(value, datetime):
+            return value.time()
+        if isinstance(value, time):
+            return value
+
+        # "16:10", "16:10:00" 형식 지원
+        return time.fromisoformat(str(value).strip())
 
     p = st.session_state.get("pending_event")
     if not p:
@@ -1950,24 +1967,28 @@ def render_pending_event():
     what = "수정" if p.get("mode") == "edit" else "추가"
 
     conflicts = find_conflicts(
-        f["date"], f["start"], f["end"], event_id
+        f["date"],
+        f["start"],
+        f["end"],
+        event_id,
     )
 
-    original_date = parse_date(f["date"])
+    original_date = to_date(f["date"])
     original_start = datetime.combine(
-        original_date, parse_time(f["start"])
+        original_date,
+        to_time(f["start"]),
     )
 
-    # 원본 인덱스를 보존해야 기존 _decide_cb가
-    # 사용자가 선택한 대체 시간을 정확히 찾을 수 있습니다.
     suggestions = []
 
     for original_index, slot in enumerate(p.get("suggestions") or []):
-        slot_date = parse_date(slot["date"])
+        slot_date = to_date(slot["date"])
         slot_start = datetime.combine(
-            slot_date, parse_time(slot["start"])
+            slot_date,
+            to_time(slot["start"]),
         )
 
+        # 기존 충돌 검사 함수의 입력 방식 유지
         available = is_free(
             slot["date"],
             parse_time(slot["start"]),
@@ -1977,6 +1998,7 @@ def render_pending_event():
 
         suggestions.append({
             "slot": slot,
+            # 화면 정렬 후에도 원래 추천 번호를 콜백에 전달
             "original_index": original_index,
             "available": available,
             "same_day": slot_date == original_date,
@@ -1985,7 +2007,7 @@ def render_pending_event():
             ),
         })
 
-    # 선택 가능한 시간 → 같은 날 → 원래 시간과 가까운 순
+    # 선택 가능 → 같은 날 → 원래 시작 시간과 가까운 순
     suggestions.sort(
         key=lambda item: (
             not item["available"],
@@ -2003,7 +2025,9 @@ def render_pending_event():
         )
 
         if conflicts:
-            st.warning(f"⚠️ 일정 충돌 감지 — {event_description}")
+            st.warning(
+                f"⚠️ 일정 충돌 감지 — {event_description}"
+            )
 
             st.markdown("**충돌하는 기존 일정**")
 
@@ -2037,6 +2061,7 @@ def render_pending_event():
                     "점심시간 12:00–13:00 제외 · "
                     "일정 앞뒤 10분 여유"
                 )
+
                 st.caption(
                     "선택 가능한 시간을 우선하고, 같은 날의 시간부터 "
                     "원래 시작 시간과 가까운 순서로 표시해요."
@@ -2044,7 +2069,8 @@ def render_pending_event():
 
             if suggestions:
                 available_count = sum(
-                    item["available"] for item in suggestions
+                    bool(item["available"])
+                    for item in suggestions
                 )
 
                 if available_count == 0:
@@ -2053,7 +2079,7 @@ def render_pending_event():
                         "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
                     )
 
-                # 추천 개수가 많아도 한 줄에 최대 3개만 표시
+                # 한 줄에 최대 3개의 추천 표시
                 for row_start in range(0, len(suggestions), 3):
                     row = suggestions[row_start:row_start + 3]
                     cols = st.columns(len(row))
@@ -2072,7 +2098,6 @@ def render_pending_event():
                                         f"**대체 시간 {display_index + 1}**"
                                     )
 
-                                # Markdown 특수문자의 영향을 받지 않도록 출력
                                 st.text(slot_text(slot))
 
                                 if available:
@@ -2080,20 +2105,27 @@ def render_pending_event():
                                         delta = item["difference_minutes"]
 
                                         if delta == 0:
-                                            reason = "원래 시작 시간과 같아요."
+                                            reason = (
+                                                "원래 시작 시간과 같아요."
+                                            )
                                         else:
                                             direction = (
-                                                "늦춘" if delta > 0 else "앞당긴"
+                                                "늦춘"
+                                                if delta > 0
+                                                else "앞당긴"
                                             )
+
                                             hours, minutes = divmod(
                                                 abs(delta), 60
                                             )
 
                                             duration_parts = []
+
                                             if hours:
                                                 duration_parts.append(
                                                     f"{hours}시간"
                                                 )
+
                                             if minutes:
                                                 duration_parts.append(
                                                     f"{minutes}분"
@@ -2116,9 +2148,11 @@ def render_pending_event():
 
                                     st.caption(reason)
                                     st.caption("✅ 현재 충돌 없음")
+
                                 else:
                                     st.caption(
-                                        "⛔ 다른 일정과 충돌해 선택할 수 없어요."
+                                        "⛔ 다른 일정과 충돌해 "
+                                        "선택할 수 없어요."
                                     )
 
                                 st.button(
@@ -2128,7 +2162,9 @@ def render_pending_event():
                                     ),
                                     on_click=_decide_cb,
                                     args=(
-                                        str(item["original_index"] + 1),
+                                        str(
+                                            item["original_index"] + 1
+                                        ),
                                     ),
                                     use_container_width=True,
                                     disabled=not available,
@@ -2138,9 +2174,11 @@ def render_pending_event():
                                         else "secondary"
                                     ),
                                 )
+
             else:
                 st.info(
-                    "2주 안에서 조건에 맞는 업무 시간을 찾지 못했어요. "
+                    "2주 안에서 조건에 맞는 업무 시간을 "
+                    "찾지 못했어요. "
                     "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
                 )
 
@@ -2154,9 +2192,11 @@ def render_pending_event():
         a, b = st.columns([2, 1])
 
         a.button(
-            "충돌을 감수하고 원래 시간으로 등록"
-            if conflicts
-            else "원래 시간으로 등록",
+            (
+                "충돌을 감수하고 원래 시간으로 등록"
+                if conflicts
+                else "원래 시간으로 등록"
+            ),
             key="pe_orig",
             on_click=_decide_cb,
             args=("original",),
@@ -2171,6 +2211,7 @@ def render_pending_event():
             args=("cancel",),
             use_container_width=True,
         )
+
 
 
 # ─────────────────────────────────────────────
