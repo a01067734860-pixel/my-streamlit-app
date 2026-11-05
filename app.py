@@ -1925,7 +1925,7 @@ def render_pending_event():
             st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
         sugg = p["suggestions"]
         if sugg:
-            st.markdown("**대체 시간 추천** · 업무 시간 9~18시, 점심 12~13시 제외, 앞뒤 10분 여유")
+            st.markdown("**대체 시간 추천** · 업무 시간 9-18시, 점심 12-13시 제외, 앞뒤 10분 여유")
             cols = st.columns(len(sugg))
             for i, s in enumerate(sugg):
                 ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
