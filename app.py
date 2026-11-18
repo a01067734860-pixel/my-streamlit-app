@@ -7,7 +7,7 @@ from types import NoneType
 #   - meeting.txt : (선택) 회의 분석 탭에서 기본으로 불러올 회의록
 #
 # 화면 구성
-#   메인 탭  : 🤖 에이블 비서 (음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
+#   메인 탭  : 🤖 에이블 비서 (입력창 맨 위·최근 대화가 위로, 에이블 로고를 눌러 녹음·생각 중·말하는 중 애니메이션, 음성/텍스트 대화, 파일 첨부, 이메일 발송 도구, 음성 답변, 멀티턴, 대화 기록/새 채팅)
 #   다른 탭  : 📊 대시보드(캘린더·주요 일정·해야 할 일) / 🎙️ 회의 분석(실시간 녹음·음성 파일·텍스트 파일)
 #              / 📥 메일 비서(메일 발송·받은 메일 요약·연락처, 보내기 전 AI 확인)
 #   사이드바 : 새 채팅·대화 기록 / 앞으로 3일 일정·할 일 마감(실시간 연동) / 최근 회의록 요약 / 최근 받은 메일 5개 요약
@@ -32,7 +32,10 @@ from email import policy
 from email.mime.text import MIMEText
 from email.utils import parseaddr, parsedate_to_datetime
 
+import base64
+import time
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 
 # ─────────────────────────────────────────────
@@ -140,7 +143,8 @@ def normalize_note(n):
             t.setdefault(k, v)
     for sc in n["schedules"]:
         for k, v in {"title": "", "when_text": "", "date_type": "none", "date": "", "evidence": "",
-                     "verified": True}.items():
+                     "verified": True, "kind": "기타", "end_date": "", "start": "", "end": "", "place": "",
+                     "kim_attends": False, "cal_status": "reference", "event_ids": [], "conflicts": []}.items():
             sc.setdefault(k, v)
     return n
 
@@ -683,15 +687,320 @@ def shrink_audio(audio_bytes, name):
     return audio_bytes, name
 
 
-def speech_to_text(audio_bytes, name="voice.wav", hint=None):
-    kwargs = {"model": "whisper-1", "file": (name, audio_bytes), "language": "ko"}
-    if hint:
-        kwargs["prompt"] = hint
-    return get_client().audio.transcriptions.create(**kwargs).text
+STT_CHAT_MODELS = ["gpt-4o-transcribe", "whisper-1"]   # 정확도가 높은 모델 먼저, 안 되면 whisper-1로
+
+
+def speech_to_text(audio_bytes, name="voice.wav", hint=None, models=("whisper-1",)):
+    last_err = None
+    for model in models:
+        kwargs = {"model": model, "file": (name, audio_bytes), "language": "ko"}
+        if hint:
+            kwargs["prompt"] = hint
+        try:
+            return get_client().audio.transcriptions.create(**kwargs).text
+        except Exception as e:              # 모델을 쓸 수 없으면 다음 모델로
+            last_err = e
+    raise last_err
+
+
+def stt_hint():
+    # 음성 인식이 이름·고유명사를 잘 받아 적도록, 자주 나올 단어를 힌트로 줌 (연락처·일정 제목·종류)
+    words = ["에이블", "김 대리", "일정", "할 일", "캘린더", "메일", "회의록", "추가해줘", "삭제해줘", "취소해줘",
+             "이번 주", "다음 주", "오전", "오후"]
+    for c in data["contacts"]:
+        words += [c["name"] + c["role"], c["alias"], c["team"]]
+    up = sorted([e for e in data["events"] if (d := parse_date(e["date"])) and d >= today],
+                key=lambda e: e["date"])[:20]
+    words += [e["title"] for e in up] + [t["title"] for t in data["todos"] if not t["done"]][:15]
+    words += EVENT_CATS + list(TODO_CATS)
+    seen, out = set(), []
+    for w in words:
+        w = clean_text(w)
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    text = ", ".join(out)[:600]               # 힌트가 너무 길면 잘리므로 적당히
+    return f"김 대리가 AI 비서 에이블에게 일정·할 일·메일을 부탁하는 한국어 음성입니다. 자주 나오는 말: {text}"
 
 
 def text_to_speech(text, voice="alloy"):
     return get_client().audio.speech.create(model="gpt-4o-mini-tts", voice=voice, input=text[:4000]).content
+
+
+# ─────────────────────────────────────────────
+# 🎙️ 에이블 로고 녹음기 (Streamlit 커스텀 컴포넌트)
+#   로고 클릭 → 녹음(목소리에 맞춰 파동) → 다시 클릭 → 파이썬으로 전달 → 생각 중 → 답변 음성 재생(말하는 중)
+#   부품 html은 앱이 실행될 때 임시 폴더에 직접 만들어서, GitHub에는 app.py만 올리면 됨
+# ─────────────────────────────────────────────
+ABLE_LOGO_B64 = "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"
+
+ABLE_MIC_HTML = r'''<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  :root { --teal:#0b9ea4; --rec:#ef4f5a; --text:#31333f; --sub:rgba(49,51,63,.6); --btn:#ffffff; --ring:rgba(11,158,164,.25); }
+  html,body { margin:0; padding:0; background:transparent; overflow:hidden;
+              font-family:"Source Sans Pro","Noto Sans KR",sans-serif; color:var(--text); }
+  .wrap { display:flex; align-items:center; gap:14px; padding:4px 2px; }
+  .wrap.big { flex-direction:column; gap:8px; }
+  .stage { position:relative; flex:0 0 auto; }
+  canvas { position:absolute; inset:0; pointer-events:none; }
+  .btn { position:absolute; border-radius:50%; border:2px solid var(--ring); background:var(--btn);
+         cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;
+         box-shadow:0 6px 22px rgba(11,158,164,.22); transition:transform .15s, box-shadow .3s, border-color .3s; outline:none; }
+  .btn:focus-visible { box-shadow:0 0 0 4px rgba(11,158,164,.45); }
+  .btn:active { transform:scale(.96); }
+  .logo { width:62%; height:62%; background:var(--teal); transition:background .3s;
+          -webkit-mask:url("data:image/png;base64,__LOGO_B64__") center/contain no-repeat;
+                  mask:url("data:image/png;base64,__LOGO_B64__") center/contain no-repeat; }
+  /* 대기: 숨쉬기 */
+  .idle .btn, .blocked .btn { animation:breathe 3.2s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { transform:scale(1); box-shadow:0 6px 22px rgba(11,158,164,.18);} 50% { transform:scale(1.045); box-shadow:0 8px 30px rgba(11,158,164,.38);} }
+  /* 녹음 중 */
+  .recording .btn { border-color:rgba(239,79,90,.55); box-shadow:0 0 0 6px rgba(239,79,90,.12), 0 8px 26px rgba(239,79,90,.25); }
+  /* 생각 중: 도는 링 */
+  .spin { position:absolute; border-radius:50%; opacity:0; transition:opacity .3s; pointer-events:none;
+          background:conic-gradient(from 0deg, transparent 0 55%, var(--teal) 85%, transparent 100%);
+          -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+                  mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+          animation:spin 1s linear infinite; }
+  .thinking .spin { opacity:1; }
+  .thinking .btn { cursor:progress; }
+  .thinking .logo { animation:think 1.6s ease-in-out infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  @keyframes think { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+  .info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .big .info { align-items:center; text-align:center; }
+  .label { font-size:15px; font-weight:600; }
+  .sub { font-size:13px; color:var(--sub); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--rec); margin-right:6px;
+         vertical-align:1px; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.2; } }
+  .err { color:var(--rec); }
+</style></head>
+<body>
+<div class="wrap idle" id="wrap">
+  <div class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div class="spin" id="spin"></div>
+    <button class="btn" id="btn" aria-label="에이블에게 말하기"><div class="logo" id="logo"></div></button>
+  </div>
+  <div class="info"><div class="label" id="label"></div><div class="sub" id="sub"></div></div>
+</div>
+<script>
+// ── Streamlit 컴포넌트 통신 (라이브러리 없이 postMessage로 직접) ──
+function toST(type, data) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*"); }
+function setHeight() { toST("streamlit:setFrameHeight", {height: document.getElementById("wrap").offsetHeight + 8}); }
+function setValue(v) { toST("streamlit:setComponentValue", {value: v, dataType: "json"}); }
+
+const $ = (id) => document.getElementById(id);
+let state = "idle", size = "", sentId = "", lastPlayId = "", thinkTimer = null;
+let recorder = null, chunks = [], stream = null, recStart = 0, timerInt = null;
+let actx = null, analyser = null, player = null, levelBuf = null, fakeLevel = false;
+const bars = new Array(72).fill(0);
+
+const TEXT = {
+  idle:      ["에이블을 눌러 말하기", "누르면 녹음이 시작되고, 다시 누르면 에이블에게 전달돼요"],
+  recording: ["", "다 말했으면 로고를 한 번 더 눌러 주세요"],
+  thinking:  ["에이블이 생각 중이에요…", "잠시만 기다려 주세요"],
+  speaking:  ["에이블이 말하는 중", "로고를 누르면 멈춰요"],
+  blocked:   ["🔊 답변이 준비됐어요", "로고를 누르면 들려 드려요"],
+};
+
+function setState(s, subText) {
+  state = s;
+  $("wrap").className = "wrap " + size + " " + s;
+  const t = TEXT[s] || ["", ""];
+  $("label").innerHTML = s === "recording" ? '<span class="dot"></span>듣고 있어요 · <span id="tm">0:00</span>' : t[0];
+  $("sub").textContent = subText || t[1];
+  $("sub").className = "sub" + (subText && s === "idle" ? " err" : "");
+  if (s !== "thinking" && thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
+  setHeight();
+}
+
+function layout(sz) {
+  size = sz === "big" ? "big" : "compact";
+  const B = size === "big" ? 120 : 76, S = size === "big" ? 210 : 132;
+  const stage = $("stage"), cv = $("cv"), btn = $("btn"), sp = $("spin");
+  stage.style.width = stage.style.height = S + "px";
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = cv.height = S * dpr; cv.style.width = cv.style.height = S + "px";
+  const off = (S - B) / 2;
+  Object.assign(btn.style, {width: B + "px", height: B + "px", left: off + "px", top: off + "px"});
+  const so = off - 7;
+  Object.assign(sp.style, {width: (B + 14) + "px", height: (B + 14) + "px", left: so + "px", top: so + "px"});
+  setState(state);
+}
+
+// ── 파동 그리기: 녹음(마이크 소리) · 말하기(답변 소리)에 맞춰 로고 주변 막대가 출렁임 ──
+function level() {
+  if (fakeLevel) { const t = performance.now() / 1000; return 0.35 + 0.25 * Math.sin(t * 9) * Math.sin(t * 2.3); }
+  if (!analyser) return 0;
+  analyser.getByteFrequencyData(levelBuf);
+  let s = 0; for (let i = 2; i < levelBuf.length * 0.5; i++) s += levelBuf[i];
+  return Math.min(1, s / (levelBuf.length * 0.5) / 110);
+}
+function draw() {
+  const cv = $("cv"), g = cv.getContext("2d"), dpr = window.devicePixelRatio || 1;
+  const S = cv.width / dpr, B = size === "big" ? 120 : 76, r0 = B / 2 + 8, maxL = (S / 2 - r0) - 4;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, S, S);
+  const active = state === "recording" || state === "speaking";
+  const lv = active ? level() : 0;
+  const color = state === "recording" ? "239,79,90" : "11,158,164";
+  const t = performance.now() / 1000;
+  for (let i = 0; i < bars.length; i++) {
+    const wobble = 0.55 + 0.45 * Math.sin(i * 0.9 + t * 6) * Math.cos(i * 0.37 - t * 3);
+    const target = active ? lv * (0.35 + 0.65 * Math.abs(wobble)) : 0;
+    bars[i] += (target - bars[i]) * 0.25;
+    const L = 2 + bars[i] * maxL;
+    if (bars[i] < 0.01 && !active) continue;
+    const a = (i / bars.length) * Math.PI * 2 - Math.PI / 2;
+    g.strokeStyle = "rgba(" + color + "," + (0.35 + bars[i] * 0.65) + ")";
+    g.lineWidth = size === "big" ? 3 : 2.2; g.lineCap = "round";
+    g.beginPath();
+    g.moveTo(S / 2 + Math.cos(a) * r0, S / 2 + Math.sin(a) * r0);
+    g.lineTo(S / 2 + Math.cos(a) * (r0 + L), S / 2 + Math.sin(a) * (r0 + L));
+    g.stroke();
+  }
+  $("logo").style.transform = active ? "scale(" + (1 + lv * 0.14) + ")" : "";
+  requestAnimationFrame(draw);
+}
+
+function ensureCtx() {
+  if (!actx) { const C = window.AudioContext || window.webkitAudioContext; if (C) actx = new C(); }
+  if (actx && actx.state === "suspended") actx.resume().catch(() => {});
+  return actx;
+}
+function useAnalyser(node) {
+  analyser = actx.createAnalyser(); analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.7;
+  levelBuf = new Uint8Array(analyser.frequencyBinCount); node.connect(analyser); return analyser;
+}
+
+// ── 녹음 ──
+async function startRec() {
+  stopPlayer();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true}});
+  } catch (e) {
+    setState("idle", "마이크를 쓸 수 없어요. 브라우저 주소창의 마이크 권한을 허용해 주세요."); return;
+  }
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  const mime = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+  try { recorder = new MediaRecorder(stream, mime ? {mimeType: mime} : undefined); }
+  catch (e) { setState("idle", "이 브라우저는 녹음을 지원하지 않아요. 크롬에서 열어 주세요."); stopStream(); return; }
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = onRecStop;
+  if (ensureCtx()) { fakeLevel = false; useAnalyser(actx.createMediaStreamSource(stream)); } else { fakeLevel = true; }
+  recorder.start(250);
+  recStart = performance.now();
+  setState("recording");
+  timerInt = setInterval(() => {
+    const s = Math.floor((performance.now() - recStart) / 1000), el = $("tm");
+    if (el) el.textContent = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+    if (s >= 120) stopRec();                    // 너무 길면 2분에서 자동 종료
+  }, 250);
+}
+function stopStream() { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; }
+function stopRec() {
+  clearInterval(timerInt);
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+function onRecStop() {
+  stopStream(); analyser = null;
+  const dur = performance.now() - recStart;
+  const type = (recorder && recorder.mimeType) || "audio/webm";
+  const blob = new Blob(chunks, {type: type});
+  if (dur < 700 || blob.size < 1500) { setState("idle", "너무 짧아요. 로고를 누르고 말한 뒤 다시 눌러 주세요."); return; }
+  const ext = type.includes("mp4") ? "mp4" : type.includes("ogg") ? "ogg" : "webm";
+  const fr = new FileReader();
+  fr.onload = () => {
+    sentId = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    setValue({id: sentId, b64: String(fr.result).split(",")[1], ext: ext});
+    setState("thinking");
+    thinkTimer = setTimeout(() => { if (state === "thinking") setState("idle"); }, 120000);
+  };
+  fr.readAsDataURL(blob);
+}
+
+// ── 답변 음성 재생 (말하는 중 애니메이션) ──
+function stopPlayer() { if (player) { player.pause(); player = null; } analyser = null; fakeLevel = false; }
+async function speak(b64) {
+  stopPlayer();
+  const a = new Audio("data:audio/mpeg;base64," + b64);
+  player = a;
+  const ctx = ensureCtx();
+  if (ctx) { try { await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 300))]); } catch (e) {} }
+  if (ctx && ctx.state === "running") {
+    try { const src = ctx.createMediaElementSource(a); useAnalyser(src); analyser.connect(ctx.destination); fakeLevel = false; }
+    catch (e) { fakeLevel = true; }
+  } else { fakeLevel = true; }               // 소리 분석이 안 되면 부드러운 가짜 파동
+  a.onended = () => { if (player === a) { stopPlayer(); setState("idle"); } };
+  try { await a.play(); setState("speaking"); }
+  catch (e) { player = null; pendingB64 = b64; setState("blocked"); }   // 자동 재생이 막히면 눌러서 듣기
+}
+let pendingB64 = "";
+
+function played(id) { try { return sessionStorage.getItem("able_played_" + id) === "1"; } catch (e) { return false; } }
+function markPlayed(id) { try { sessionStorage.setItem("able_played_" + id, "1"); } catch (e) {} }
+
+$("btn").addEventListener("click", () => {
+  if (state === "idle") startRec();
+  else if (state === "recording") stopRec();
+  else if (state === "speaking") { stopPlayer(); setState("idle"); }
+  else if (state === "blocked") { const b = pendingB64; pendingB64 = ""; speak(b); }
+});
+
+// ── 파이썬에서 받은 값으로 상태 바꾸기 ──
+window.addEventListener("message", (ev) => {
+  const d = ev.data || {};
+  if (d.type !== "streamlit:render") return;
+  const args = d.args || {};
+  const th = d.theme || {};
+  if (th.textColor) document.documentElement.style.setProperty("--text", th.textColor);
+  if (th.base === "dark") {
+    document.documentElement.style.setProperty("--btn", "#1d2531");
+    document.documentElement.style.setProperty("--sub", "rgba(250,250,250,.6)");
+  }
+  if (args.size && (args.size === "big" ? "big" : "compact") !== size) layout(args.size);
+  // 내가 보낸 녹음 처리가 끝났는데 들려줄 답변이 없으면 대기로
+  if (state === "thinking" && sentId && args.done_id === sentId && !(args.play_id && !played(args.play_id))) setState("idle");
+  // 새 답변 음성이 오면 말하기
+  if (args.play_id && args.play_b64 && args.play_id !== lastPlayId && !played(args.play_id) && state !== "recording") {
+    lastPlayId = args.play_id; markPlayed(args.play_id); speak(args.play_b64);
+  }
+});
+
+layout("compact");
+requestAnimationFrame(draw);
+toST("streamlit:componentReady", {apiVersion: 1});
+window.addEventListener("resize", setHeight);
+</script>
+</body></html>
+'''
+
+
+def _declare_able_mic():
+    page = ABLE_MIC_HTML.replace("__LOGO_B64__", ABLE_LOGO_B64)
+    ver = hashlib.md5(page.encode("utf-8")).hexdigest()[:8]           # 내용이 바뀌면 새 폴더 → 브라우저 캐시 문제 없음
+    folder = Path(tempfile.gettempdir()) / f"able_mic_{ver}"
+    folder.mkdir(parents=True, exist_ok=True)
+    f = folder / "index.html"
+    if not f.exists():
+        f.write_text(page, encoding="utf-8")
+    return components.declare_component("able_mic", path=str(folder))
+
+
+_able_mic = _declare_able_mic()
+
+
+def able_mic(size, key):
+    # size: "big"(새 채팅 첫 화면) / "compact"(말로 이어서 요청하기). 녹음하면 {"id","b64","ext"}를 돌려줌
+    play = st.session_state.get("mic_play")
+    if play and time.time() - play["ts"] > 90:     # 오래된 답변 음성은 다시 보내지 않음
+        st.session_state.pop("mic_play", None)
+        play = None
+    return _able_mic(size=size, play_id=play["id"] if play else "", play_b64=play["b64"] if play else "",
+                     done_id=st.session_state.get("voice_done", ""), key=key, default=None)
 
 
 # ─────────────────────────────────────────────
@@ -758,12 +1067,86 @@ def apply_kim_tasks(tasks, source_text, source_label):
                 detail += f" / 요청: {t['requester']}"
             if t["due_text"] and not exact:
                 detail += f" / 기한(대략): {t['due_text']}"
+            elif t["due_text"] and re.search(r"\d+\s*시|오전|오후", t["due_text"]):
+                detail += f" / 마감: {t['due_text']}"
             item = add_todo(title, t["due_date"] if exact else "", t["priority"], detail.strip(" /"), source_label)
             undone_titles[title] = item["id"]
             t.update(status="calendar" if exact else ("approximate" if t["due_type"] == "approximate" else "nodue"),
                      todo_id=item["id"])
         out.append(t)
     return out
+
+
+MEETING_WORDS = re.compile(r"회의|미팅|상담|면담|방문|워크숍|세미나|간담회|참석")
+WORK_WORDS = re.compile(r"자료|보고서|문서|작성|준비|정리|초안|조사|분석|제출|검토|확인|공유|전달")
+
+
+def split_meeting_tasks(tasks):
+    # AI가 '회의 참석'을 김 대리 업무로 넣은 경우 → 할 일이 아니라 일정으로 옮김
+    work, meetings = [], []
+    for t in tasks:
+        if MEETING_WORDS.search(t["title"]) and not WORK_WORDS.search(t["title"]):
+            meetings.append({"title": re.sub(r"\s*참석$", "", t["title"]).strip(), "kind": "회의·미팅",
+                             "when_text": t["due_text"], "date_type": t["due_type"], "date": t["due_date"],
+                             "end_date": "", "start": "", "end": "", "place": "", "kim_attends": True,
+                             "evidence": t["evidence"]})
+        else:
+            work.append(t)
+    return work, meetings
+
+
+def same_event(e, title, date, start):
+    # 이미 캘린더에 있는 같은 일정인지 (제목이 비슷하고 날짜가 같으면, 시간이 있으면 시간도 같으면)
+    if e["date"] != date or (start and e["start"] and e["start"] != start):
+        return False
+    a, b = _squash(e["title"]), _squash(title)
+    return a == b or (min(len(a), len(b)) >= 3 and (a in b or b in a))
+
+
+def apply_meeting_schedules(schedules, source_text, note_title):
+    # 회의에서 언급된 일정을 캘린더에 반영
+    #   · 회의·미팅(김 대리 참석)과 회사 행사 → 캘린더 일정으로 자동 등록 (기간 행사는 시작일·종료일)
+    #   · 다른 사람 마감, 날짜가 정확하지 않은 일정, 근거가 원문에 없는 일정 → 회의록에서 참고로만 보여 줌
+    #   · 기존 일정과 겹쳐도 회의 내용 그대로 등록하고, 겹친다는 표시만 남김 (임의로 옮기거나 지우지 않음)
+    out = []
+    for s in schedules:
+        s = dict(s, verified=found_in(s["evidence"], source_text), event_ids=[], conflicts=[])
+        d = parse_date(s["date"]) if s["date_type"] == "exact" else None
+        wanted = (s["kind"] == "회의·미팅" and s["kim_attends"]) or s["kind"] == "회사 행사"
+        if not s["verified"]:
+            s["cal_status"] = "unverified"
+        elif not d or not wanted:
+            s["cal_status"] = "reference"
+        else:
+            days = [(d.isoformat(), s["title"], s["start"], s["end"])]
+            end_d = parse_date(s["end_date"])
+            if s["kind"] == "회사 행사" and end_d and end_d > d:
+                days = [(d.isoformat(), f"{s['title']} 시작 (~{fmt_date(end_d)})", "", ""),
+                        (end_d.isoformat(), f"{s['title']} 종료", "", "")]
+            status = "calendar"
+            for date_iso, title, start, end in days:
+                dup = next((e for e in data["events"] if same_event(e, title, date_iso, start)), None)
+                if dup:
+                    s["event_ids"].append(dup["id"])
+                    status = "duplicate" if status == "calendar" and len(days) == 1 else status
+                    continue
+                note = f"[회의: {note_title}]" + (f" 장소: {s['place']}" if s["place"] else "")
+                f = build_event(title, date_iso, start, end, "", note)
+                s["conflicts"] += [conflict_text(c) for c in find_conflicts(f["date"], f["start"], f["end"])]
+                s["event_ids"].append(commit_event(f, "add", None, "회의 분석")["id"])
+            s["cal_status"] = "conflict" if s["conflicts"] else status
+        out.append(s)
+    return out
+
+
+def schedule_status_line(s):
+    return {
+        "calendar": "📅 캘린더에 일정으로 추가했어요",
+        "conflict": "⚠️ 캘린더에 추가했어요 · 겹치는 일정: " + ", ".join(s.get("conflicts", [])),
+        "duplicate": "↔️ 이미 캘린더에 있는 일정이에요",
+        "reference": "참고용 · 캘린더에는 넣지 않았어요",
+        "unverified": "⚠️ 원문에서 근거 문장을 찾지 못해 캘린더에 넣지 않았어요",
+    }.get(s.get("cal_status"), "")
 
 
 def task_status_line(t):
@@ -916,15 +1299,22 @@ def review_email(rcpt, subject, body, context=""):
         resp = get_client().responses.create(
             model=MODEL,
             instructions="\n".join([
-                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 점검합니다.",
+                "당신은 '김 대리'의 개인 비서 '에이블'입니다. 김 대리가 메일을 보내기 전에 마지막으로 한 번 점검합니다.",
+                f"오늘 날짜: {today.isoformat()} ({WEEKDAYS[today.weekday()]}요일)",
+                date_table(),
                 "아래 다섯 항목을 모두 점검해 항목마다 ok(true/false)와 짧은 comment를 씁니다.",
+                "실제로 잘못 보낼 위험이 있을 때만 false로 하고, 사소하거나 애매하면 ok=true로 둡니다.",
                 "- 받는 사람: [요청/상황]에서 의도한 사람과 [받는 사람] 정보가 맞는지. 요청에 받는 사람 언급이 없으면 ok.",
-                "- 내용 정확성: 본문에 [요청/상황]·[참고 자료]에 없는 날짜·숫자·약속·사실이 들어갔는지. 지어낸 내용이 있으면 false.",
+                "- 내용 정확성: 본문의 날짜·숫자·약속이 [요청/상황]·[이전 대화]·[참고 자료]와 '어긋날' 때만 false.",
+                "  '내일', '금요일', '다음 주 화요일'처럼 요청한 표현을 [날짜표]에 맞는 실제 날짜(예: 11월 7일)로 바꿔 쓴 것은 정상(ok)입니다.",
+                "  요일과 날짜가 날짜표와 맞지 않거나, 요청과 다른 날짜·금액이 들어간 경우만 문제입니다.",
+                "  메일에 흔히 들어가는 인사·마무리 문장, 요청 내용을 정리한 표현은 지어낸 내용이 아닙니다.",
                 "- 빠진 내용: 요청한 내용이 빠졌는지, '첨부'를 언급했는데 실제 첨부가 없는지(이 메일은 첨부를 보낼 수 없음).",
                 "- 말투·맞춤법: 받는 사람에게 맞는 정중한 말투인지, 오탈자가 있는지.",
                 "- 민감 정보: 비밀번호·주민번호·계좌번호 같은 민감 정보가 들어 있는지.",
                 "비교할 자료가 없어 판단할 수 없으면 추측하지 말고 ok=true, comment에 '비교할 자료 없음'이라고 씁니다.",
-                "summary: 김 대리에게 하는 한 문장 결론 (예: '보내도 괜찮아 보여요.' / '요청에 없는 날짜가 있어 확인이 필요해요.').",
+                "summary: 김 대리에게 하는 한 문장 결론. 문제가 없으면 '보내도 괜찮아 보여요.',",
+                "  문제가 있으면 무엇이 왜 문제인지 구체적으로 (예: '요청은 금요일인데 본문에 목요일(11/6)로 적혀 있어요.').",
             ]),
             input=(f"[받는 사람] {who} <{rcpt['email']}>\n\n[요청/상황]\n{context or '(없음)'}\n\n"
                    f"[제목] {subject}\n\n[본문]\n{body}"),
@@ -985,28 +1375,81 @@ def confirm_and_send(key, to_raw, subject, body, context="", reply_to_id=""):
 # ─────────────────────────────────────────────
 # 캘린더 · 화면 스타일
 # ─────────────────────────────────────────────
+ABLE_TEAL, ABLE_TEAL_DARK = "#0b9ea4", "#087e83"
+_LOGO_MASK = f"url('data:image/png;base64,{ABLE_LOGO_B64}') center/contain no-repeat"
 APP_CSS = [
-    ".able-hero {padding:18px 22px; border-radius:16px; margin-bottom:10px;"
-    " background:linear-gradient(135deg, rgba(62,123,250,.16), rgba(139,92,246,.12));"
-    " border:1px solid rgba(128,128,128,.2);}",
-    ".able-title {font-size:1.65rem; font-weight:700; line-height:1.3;}",
-    ".able-sub {opacity:.75; font-size:.9rem; margin:2px 0 10px;}",
-    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; margin:2px 6px 2px 0;"
-    " border-radius:999px; background:rgba(128,128,128,.16);}",
-    ".able-chip.warn {background:rgba(229,72,77,.2);}",
+    # 브랜드 색 (Streamlit 기본 빨강 → 에이블 청록)
+    f":root {{--able:{ABLE_TEAL}; --able-dark:{ABLE_TEAL_DARK}; --able-soft:rgba(11,158,164,.10);}}",
+    "button[kind='primary'], [data-testid='stBaseButton-primary'] {background:var(--able) !important;"
+    " border-color:var(--able) !important; color:#fff !important;}",
+    "button[kind='primary']:hover, [data-testid='stBaseButton-primary']:hover {background:var(--able-dark) !important;"
+    " border-color:var(--able-dark) !important;}",
+    "button[kind='secondary']:hover, [data-testid='stBaseButton-secondary']:hover {border-color:var(--able) !important;"
+    " color:var(--able-dark) !important;}",
+    "button:focus-visible {box-shadow:0 0 0 3px rgba(11,158,164,.35) !important;}",
+    "[data-baseweb='tab-highlight'] {background-color:var(--able) !important;}",
+    "[data-baseweb='tab'][aria-selected='true'] p {color:var(--able-dark) !important; font-weight:600;}",
+    "[data-baseweb='tab']:hover p {color:var(--able-dark) !important;}",
+    "label[data-baseweb='radio']:has(input:checked) > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input:checked) > span {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-baseweb='checkbox']:has(input[role='switch']:checked) > div {background-color:var(--able) !important;}",
+    # (새 버전 Streamlit 구조) 라디오·체크박스·토글
+    "[data-testid='stRadioOption'][data-selected='true'] > div > div:first-child {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "label[data-selected='true']:not([data-testid='stRadioOption']) > span + div {background-color:var(--able) !important;"
+    " border-color:var(--able) !important;}",
+    "input:focus, textarea:focus, [data-baseweb='select'] > div:focus-within {border-color:var(--able) !important;}",
+    "a {color:var(--able-dark);}",
+    # 로고 마크 (로고 색을 그대로 씀)
+    f".able-mark {{display:inline-block; width:28px; height:28px; flex:0 0 auto; background:var(--able);"
+    f" -webkit-mask:{_LOGO_MASK}; mask:{_LOGO_MASK};}}",
+    ".able-mark.big {width:40px; height:40px;}",
+    ".able-side-brand {display:flex; align-items:center; gap:10px; margin:0 0 12px;}",
+    ".able-side-brand b {font-size:1.25rem;}",
+    # 헤더: 한 줄 (로고 · 제목/날짜 · 오늘 요약 칩)
+    ".able-hero {display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:12px 18px; border-radius:14px;"
+    " margin-bottom:6px; background:var(--able-soft); border:1px solid rgba(11,158,164,.22);}",
+    ".able-hero-text {flex:1 1 220px; min-width:0;}",
+    ".able-chips {display:flex; flex-wrap:wrap; gap:6px;}",
+    ".able-title {font-size:1.3rem; font-weight:700; line-height:1.25;}",
+    ".able-sub {opacity:.72; font-size:.85rem; margin-top:1px;}",
+    ".able-chip {display:inline-block; font-size:.78rem; padding:3px 10px; border-radius:999px;"
+    " background:rgba(128,128,128,.10); border:1px solid rgba(11,158,164,.25); white-space:nowrap;}",
+    ".able-chip.warn {background:rgba(229,72,77,.14); border-color:rgba(229,72,77,.35);}",
+    # 대시보드 오늘 요약 카드
+    ".able-cards {display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:10px; margin:4px 0 12px;}",
+    "@media (max-width:900px) {.able-cards {grid-template-columns:repeat(2, minmax(0,1fr));}}",
+    ".able-card {border:1px solid rgba(128,128,128,.22); border-left:4px solid var(--c, var(--able)); border-radius:10px;"
+    " padding:10px 12px; min-width:0; background:rgba(128,128,128,.04);}",
+    ".able-card .k {font-size:.76rem; opacity:.7; letter-spacing:.02em;}",
+    ".able-card .v {font-size:1.05rem; font-weight:700; margin-top:2px; overflow:hidden; text-overflow:ellipsis;"
+    " white-space:nowrap;}",
+    ".able-card .m {font-size:.8rem; opacity:.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}",
+    ".able-card .big {font-size:1.6rem; font-weight:700; line-height:1.15; font-variant-numeric:tabular-nums;}",
     ".able-badge {display:inline-block; padding:1px 8px; border-radius:999px; font-size:.72rem;"
     " font-weight:600; margin-right:4px; vertical-align:1px;}",
     ".able-meta {opacity:.75; font-size:.83rem;}",
     ".able-warn {color:#e5484d; font-size:.8rem;}",
-    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.35; margin-top:2px; padding:1px 4px;"
-    " border-radius:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}",
+    ".able-cal .pill {display:block; font-size:.7rem; line-height:1.3; margin-top:3px; padding:2px 4px;"
+    " border-radius:4px;}",
+    ".able-cal .pill .tm {display:block; font-size:.64rem; opacity:.75; font-variant-numeric:tabular-nums;}",
+    ".able-cal .pill .t {display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;"
+    " word-break:keep-all; overflow-wrap:anywhere;}",
     ".able-cal .pill.done {text-decoration:line-through; opacity:.45;}",
     ".able-cal .more {font-size:.68rem; opacity:.6; margin-top:2px;}",
     ".legend {margin-top:4px;} .legend span {font-size:.74rem; margin-right:10px; white-space:nowrap;}",
     ".cal-head {text-align:center; font-size:.8rem; font-weight:600; opacity:.8; padding-bottom:2px;}",
-    ".cal-cell {height:58px; overflow:hidden; margin-top:-10px;}",
+    ".cal-cell {min-height:70px; overflow:hidden; margin-top:-12px; padding-bottom:4px;"
+    " border-bottom:1px solid rgba(128,128,128,.14);}",
     ".cal-cell.other {opacity:.35;}",
-    ".st-key-able_cal button {padding:0 4px; min-height:32px;}",
+    ".st-key-able_cal button {padding:0 4px; min-height:30px; justify-content:flex-start;}",
+    ".st-key-able_cal button[kind='secondary'], .st-key-able_cal [data-testid='stBaseButton-secondary'] {"
+    " background:transparent !important; border-color:transparent !important; box-shadow:none !important;}",
+    ".st-key-able_cal button[kind='secondary']:hover, .st-key-able_cal [data-testid='stBaseButton-secondary']:hover {"
+    " background:var(--able-soft) !important;}",
+    ".st-key-able_cal button p {font-weight:600; font-variant-numeric:tabular-nums;}",
     ".st-key-able_cal [data-testid='stHorizontalBlock'] {gap:.35rem;}",
     "[class*='st-key-act_'] {gap:.3rem;}",
     "[class*='st-key-act_'] button {min-height:28px; padding:2px 6px;}",
@@ -1046,10 +1489,16 @@ def items_by_date():
 
 
 def pill_html(kind, label, color):
-    t = html.escape(label)
+    # 시간(있으면)은 작은 글씨 한 줄, 제목은 두 줄까지 보여 줌 · 마우스를 올리면 전체 제목
+    tm, rest = "", label
+    m = re.match(r"^(\d{1,2}:\d{2})\s+(.*)$", label)
+    if m:
+        tm, rest = m.group(1), m.group(2)
+    full = html.escape(label)
     line = "solid" if kind == "event" else "dashed"            # 할 일 마감은 점선
-    return (f'<span class="pill {kind}" title="{t}" '
-            f'style="border-left:3px {line} {color}; background:{color}24">{t}</span>')
+    return (f'<span class="pill {kind}" title="{full}" '
+            f'style="border-left:3px {line} {color}; background:{color}24">'
+            + (f'<span class="tm">{tm}</span>' if tm else "") + f'<span class="t">{html.escape(rest)}</span></span>')
 
 
 def legend_html():
@@ -1404,6 +1853,43 @@ def render_calendar(year, month):
     st.caption("날짜를 누르면 그 날 일정을 보고 추가·수정·삭제할 수 있어요.")
 
 
+def dashboard_cards_html(undone, overdue, due_this_week, today_events):
+    # 대시보드 맨 위 '오늘 한눈에' 카드: 다음 일정 · 가장 급한 마감 · 남은 할 일 · 오늘 일정/충돌
+    now_hm = dt.datetime.now(KST).strftime("%H:%M")
+    upcoming = sorted([e for e in data["events"] if (d := parse_date(e["date"]))
+                       and (d > today or (d == today and (e["end"] or e["start"] or "23:59") >= now_hm))],
+                      key=lambda e: (e["date"], e["start"] or "00:00"))
+    dues = sorted([t for t in undone if parse_date(t["due"])], key=lambda t: (t["due"], PRIORITY_ORDER[t["priority"]]))
+    esc = html.escape
+
+    def card(key, value, meta, color, big=False):
+        v = f'<div class="big">{value}</div>' if big else f'<div class="v" title="{esc(value)}">{esc(value)}</div>'
+        return (f'<div class="able-card" style="--c:{color}"><div class="k">{key}</div>{v}'
+                f'<div class="m" title="{esc(meta)}">{esc(meta)}</div></div>')
+
+    if upcoming:
+        e = upcoming[0]
+        d = parse_date(e["date"])
+        when = ("오늘" if d == today else "내일" if (d - today).days == 1 else fmt_date(d)) + " " + event_time_text(e)
+        c1 = card("다음 일정", e["title"], when, ev_color(e))
+    else:
+        c1 = card("다음 일정", "예정된 일정 없음", "캘린더에서 날짜를 눌러 추가해요", "#94a3b8")
+    if dues:
+        t = dues[0]
+        d = parse_date(t["due"])
+        color = "#e5484d" if d <= today + dt.timedelta(days=1) else "#d97706" if (d - today).days <= 3 else "#2563eb"
+        c2 = card("가장 급한 마감", t["title"], f"{d_day(d)} · {fmt_date(d)} · {t['priority']}", color)
+    else:
+        c2 = card("가장 급한 마감", "마감 있는 할 일 없음", f"기한 없는 할 일 {len(undone)}건", "#94a3b8")
+    c3 = card("남은 할 일", f"{len(undone)}건",
+              (f"기한 지남 {len(overdue)}건 · " if overdue else "") + f"이번 주 마감 {len(due_this_week)}건",
+              "#e5484d" if overdue else ABLE_TEAL, big=True)
+    ov = count_overlaps()
+    c4 = card("오늘 일정", f"{len(today_events)}건", f"⚠️ 겹치는 일정 {ov}건" if ov else "겹치는 일정 없음",
+              "#e5484d" if ov else ABLE_TEAL, big=True)
+    return f'<div class="able-cards">{c1}{c2}{c3}{c4}</div>'
+
+
 def count_overlaps():
     n = 0
     for e in data["events"]:
@@ -1417,7 +1903,8 @@ def count_overlaps():
 # 자연어로 일정 삭제: 대상을 보여 주고 김 대리가 승인한 뒤에만 삭제
 # ─────────────────────────────────────────────
 DELETE_MAX = 5
-DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거"}
+DELETE_STOP = {"일정", "스케줄", "거", "것", "그거", "약속잡은거", "할일", "투두", "todo", "업무", "목록"}
+KIND_NAME = {"events": "일정", "todos": "할 일"}
 
 
 def _nospace(s):
@@ -1445,6 +1932,53 @@ def find_delete_candidates(date_iso, keyword):
     return [x[3] for x in scored[:DELETE_MAX]]
 
 
+def todo_due_text(t):
+    d = parse_date(t["due"])
+    return (f"마감 {fmt_date(d)}" if d else "기한 없음") + (" · 완료" if t["done"] else "")
+
+
+def find_todo_delete_candidates(keyword, status):
+    # status: 미완료 / 완료 / 전체. 키워드가 제목·세부 내용·분류에 가장 많이 들어간 할 일만 후보로 (최대 5개)
+    words = [_nospace(w) for w in re.split(r"[\s,]+", keyword or "") if w and _nospace(w) not in DELETE_STOP]
+    pool = [t for t in data["todos"]
+            if status == "전체" or (status == "완료") == bool(t["done"])]
+    if not words and status != "완료":          # 키워드 없이 '전부'는 완료한 할 일 정리일 때만 허용
+        return [], len(pool)
+    scored = []
+    for t in pool:
+        text = _nospace(t["title"] + " " + t.get("detail", ""))      # 분류 이름(예: 조사·분석)은 비교하지 않음
+        score = sum(w in text for w in words)
+        if score or not words:
+            scored.append((-score, PRIORITY_ORDER.get(t["priority"], 1), t["due"] or "9999", t))
+    scored.sort(key=lambda x: x[:3])
+    if scored and words:
+        scored = [x for x in scored if x[0] == scored[0][0]]
+    return [x[3] for x in scored[:DELETE_MAX]], len(scored)
+
+
+def request_delete_todo(keyword, status):
+    # 바로 지우지 않고 삭제할 할 일 후보를 승인 대기(pending_delete)로 저장
+    status = status if status in ("미완료", "완료", "전체") else "미완료"
+    cands, total = find_todo_delete_candidates(keyword, status)
+    if not cands:
+        pool = [t for t in data["todos"] if status == "전체" or (status == "완료") == bool(t["done"])]
+        return {"status": "failed",
+                "error": (f"'{keyword}'에 해당하는 할 일을 찾지 못했습니다." if keyword else
+                          "어떤 할 일을 지울지 알 수 없습니다. 할 일 이름을 알려 달라고 하세요.")
+                         + " 아무것도 삭제하지 않았습니다.",
+                "todos": [f"{t['title']} ({todo_due_text(t)})" for t in pool[:15]]}
+    st.session_state.pending_delete = {"kind": "todos", "ids": [t["id"] for t in cands],
+                                       "query": keyword or f"{status} 할 일"}
+    st.session_state.pending_toast = "⚠️ 삭제할 할 일을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
+    out = {"status": "needs_approval", "kind": "delete_todo",
+           "candidates": [{"no": i + 1, "title": t["title"], "category": t["category"], "when": todo_due_text(t)}
+                          for i, t in enumerate(cands)],
+           "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
+    if total > len(cands):
+        out["note"] = f"조건에 맞는 할 일이 {total}건이라 앞의 {len(cands)}건만 보여 줍니다."
+    return out
+
+
 def request_delete(date_iso, keyword):
     # 바로 지우지 않고 삭제 후보를 승인 대기(pending_delete)로 저장
     if date_iso and not parse_date(date_iso):
@@ -1455,7 +1989,7 @@ def request_delete(date_iso, keyword):
         return {"status": "failed",
                 "error": f"'{keyword or date_iso}'에 해당하는 일정을 찾지 못했습니다. 아무것도 삭제하지 않았습니다.",
                 "events_on_date": [f"{e['title']} ({event_time_text(e)})" for e in same_day]}
-    st.session_state.pending_delete = {"ids": [e["id"] for e in cands], "query": keyword or date_iso}
+    st.session_state.pending_delete = {"kind": "events", "ids": [e["id"] for e in cands], "query": keyword or date_iso}
     st.session_state.pending_toast = "⚠️ 삭제할 일정을 화면 위 카드에서 확인해 주세요. 승인하기 전에는 지우지 않아요."
     return {"status": "needs_approval", "kind": "delete",
             "candidates": [{"no": i + 1, "title": e["title"], "category": e["category"],
@@ -1464,33 +1998,46 @@ def request_delete(date_iso, keyword):
             "message": "아직 삭제하지 않았습니다. 삭제 대상을 보여 주고 김 대리의 승인(번호/전부/취소)을 기다립니다."}
 
 
+def pending_delete_kind():
+    p = st.session_state.get("pending_delete")
+    return p.get("kind", "events") if p else "events"
+
+
 def pending_delete_events():
+    # 삭제 승인 대기 중인 항목 (일정 또는 할 일)
     p = st.session_state.get("pending_delete")
     if not p:
         return []
-    by_id = {e["id"]: e for e in data["events"]}
+    by_id = {x["id"]: x for x in data[pending_delete_kind()]}
     return [by_id[i] for i in p["ids"] if i in by_id]
+
+
+def delete_item_text(kind, x):
+    if kind == "todos":
+        return f"{x['title']} ({todo_due_text(x)})"
+    return f"{x['title']} ({fmt_date(parse_date(x['date']))} {event_time_text(x)})"
 
 
 def decide_pending_delete(choice):
     # 김 대리 승인: 번호(1~5) / all(후보 전부) / cancel(삭제하지 않음)
     evs = pending_delete_events()
+    kind = pending_delete_kind()
     if not st.session_state.get("pending_delete"):
-        return {"status": "failed", "error": "삭제 승인을 기다리는 일정이 없습니다."}
+        return {"status": "failed", "error": "삭제 승인을 기다리는 일정·할 일이 없습니다."}
     if choice == "cancel" or not evs:
         st.session_state.pop("pending_delete", None)
-        return {"status": "success", "decision": "취소", "deleted": []}
+        return {"status": "success", "decision": "취소", "deleted": [], "kind": KIND_NAME[kind]}
     if choice == "all":
         targets = evs
     elif choice.isdigit() and 1 <= int(choice) <= len(evs):
         targets = [evs[int(choice) - 1]]
     else:
-        return {"status": "failed", "error": f"{choice}번 일정이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
+        return {"status": "failed", "error": f"{choice}번 {KIND_NAME[kind]}이 없습니다. 1~{len(evs)}, all, cancel 중에서 골라 주세요."}
     for e in targets:
-        delete_item("events", e["id"])
+        delete_item(kind, e["id"])
     st.session_state.pop("pending_delete", None)
-    return {"status": "success", "decision": "삭제",
-            "deleted": [f"{e['title']} ({fmt_date(parse_date(e['date']))} {event_time_text(e)})" for e in targets]}
+    return {"status": "success", "decision": "삭제", "kind": KIND_NAME[kind],
+            "deleted": [delete_item_text(kind, e) for e in targets]}
 
 
 def _delete_cb(choice):
@@ -1498,9 +2045,9 @@ def _delete_cb(choice):
     if r["status"] != "success":
         st.session_state.pending_toast = f"⚠️ {r['error']}"
     elif r["decision"] == "취소":
-        st.session_state.pending_toast = "일정 삭제를 취소했어요. 일정은 그대로 있어요."
+        st.session_state.pending_toast = f"{r['kind']} 삭제를 취소했어요. 그대로 있어요."
     else:
-        st.session_state.pending_toast = "일정을 삭제했어요: " + ", ".join(r["deleted"])
+        st.session_state.pending_toast = f"{r['kind']}을 삭제했어요: " + ", ".join(r["deleted"])
 
 
 def render_pending_delete():
@@ -1510,12 +2057,14 @@ def render_pending_delete():
     if not evs:                                  # 그 사이 다른 곳에서 지워졌으면 카드 닫기
         st.session_state.pop("pending_delete", None)
         return
+    kind = pending_delete_kind()
+    what = KIND_NAME[kind]
     with st.container(border=True):
-        st.error(f"🗑️ 일정 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 일정 {len(evs)}건")
-        st.caption("승인하기 전에는 삭제하지 않아요. 지울 일정을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
+        st.error(f"🗑️ {what} 삭제 확인 — '{st.session_state.pending_delete['query']}'에 해당하는 {what} {len(evs)}건")
+        st.caption(f"승인하기 전에는 삭제하지 않아요. 지울 {what}을 골라 주세요. 에이블 비서에게 '1번 지워줘', '취소'라고 말해도 돼요.")
         for i, e in enumerate(evs):
             a, b = st.columns([5, 1.3])
-            a.markdown(f"**{i + 1}.** " + event_html(e), unsafe_allow_html=True)
+            a.markdown(f"**{i + 1}.** " + (todo_html(e) if kind == "todos" else event_html(e)), unsafe_allow_html=True)
             b.button("🗑️ 삭제", key=f"pd_del_{e['id']}", on_click=_delete_cb, args=(str(i + 1),), type="primary",
                      use_container_width=True)
         c1, c2, _ = st.columns([1.4, 1, 3])
@@ -1535,37 +2084,557 @@ def _decide_cb(choice):
 
 
 def render_pending_event():
-    # 일정 충돌 → 사용자 승인: 대체 시간 선택 / 원래 시간으로 등록 / 취소
+    from datetime import datetime, date, time
+
+    # 날짜·시간 비교용 변환 함수
+    def to_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+
+        return date.fromisoformat(str(value).strip()[:10])
+
+    def to_time(value):
+        if isinstance(value, datetime):
+            return value.time()
+        if isinstance(value, time):
+            return value
+
+        # "16:10", "16:10:00" 형식 지원
+        return time.fromisoformat(str(value).strip())
+
     p = st.session_state.get("pending_event")
     if not p:
         return
-    f = p["fields"]
-    conflicts = find_conflicts(f["date"], f["start"], f["end"], p["event_id"])
-    with st.container(border=True):
-        what = "수정" if p["mode"] == "edit" else "추가"
-        st.warning(f"⚠️ 일정 충돌 감지 — {what}하려는 '{f['title']}' "
-                   f"({fmt_date(parse_date(f['date']))} {event_time_text(f)}, {f['category']})")
-        if conflicts:
-            st.markdown("<br>".join(f"{badge(c['category'], ev_color(c))}{html.escape(c['title'])} · "
-                                    f"{event_time_text(c)} — <b>{c['reason']}</b>" for c in conflicts),
-                        unsafe_allow_html=True)
-            st.caption("기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. 어떻게 할까요?")
-        else:
-            st.caption("지금은 겹치는 일정이 없어졌어요. 원래 시간으로 등록할 수 있어요.")
-        sugg = p["suggestions"]
-        if sugg:
-            st.markdown("**대체 시간 추천** · 업무 시간 9~18시, 점심 12~13시 제외, 앞뒤 10분 여유")
-            cols = st.columns(len(sugg))
-            for i, s in enumerate(sugg):
-                ok = is_free(s["date"], parse_time(s["start"]), parse_time(s["end"]), p["event_id"])
-                cols[i].button(f"{i + 1}. {slot_text(s)}", key=f"pe_s{i}", on_click=_decide_cb, args=(str(i + 1),),
-                               use_container_width=True, disabled=not ok, type="primary" if i == 0 else "secondary")
-        else:
-            st.caption("2주 안에서 충돌하지 않는 업무 시간을 찾지 못했어요.")
-        a, b, _ = st.columns([1.4, 1, 3])
-        a.button("원래 시간으로 등록", key="pe_orig", on_click=_decide_cb, args=("original",), use_container_width=True)
-        b.button("취소", key="pe_cancel", on_click=_decide_cb, args=("cancel",), use_container_width=True)
 
+    f = p["fields"]
+    event_id = p.get("event_id")
+    what = "수정" if p.get("mode") == "edit" else "추가"
+
+    conflicts = find_conflicts(
+        f["date"],
+        f["start"],
+        f["end"],
+        event_id,
+    )
+
+    original_date = to_date(f["date"])
+    original_start = datetime.combine(
+        original_date,
+        to_time(f["start"]),
+    )
+
+    suggestions = []
+
+    for original_index, slot in enumerate(p.get("suggestions") or []):
+        slot_date = to_date(slot["date"])
+        slot_start = datetime.combine(
+            slot_date,
+            to_time(slot["start"]),
+        )
+
+        # 기존 충돌 검사 함수의 입력 방식 유지
+        available = is_free(
+            slot["date"],
+            parse_time(slot["start"]),
+            parse_time(slot["end"]),
+            event_id,
+        )
+
+        suggestions.append({
+            "slot": slot,
+            # 화면 정렬 후에도 원래 추천 번호를 콜백에 전달
+            "original_index": original_index,
+            "available": available,
+            "same_day": slot_date == original_date,
+            "difference_minutes": int(
+                (slot_start - original_start).total_seconds() / 60
+            ),
+        })
+
+    # 선택 가능 → 같은 날 → 원래 시작 시간과 가까운 순
+    suggestions.sort(
+        key=lambda item: (
+            not item["available"],
+            not item["same_day"],
+            abs(item["difference_minutes"]),
+            item["original_index"],
+        )
+    )
+
+    with st.container(border=True):
+        event_description = (
+            f"{what}하려는 '{f['title']}' "
+            f"({fmt_date(original_date)} "
+            f"{event_time_text(f)}, {f['category']})"
+        )
+
+        if conflicts:
+            st.warning(
+                f"⚠️ 일정 충돌 감지 — {event_description}"
+            )
+
+            st.markdown("**충돌하는 기존 일정**")
+
+            conflict_lines = []
+
+            for conflict in conflicts:
+                conflict_lines.append(
+                    f"{badge(conflict['category'], ev_color(conflict))}"
+                    f"{html.escape(str(conflict['title']))} · "
+                    f"{html.escape(str(event_time_text(conflict)))}"
+                    f" — <b>"
+                    f"{html.escape(str(conflict.get('reason', '일정 충돌')))}"
+                    f"</b>"
+                )
+
+            st.markdown(
+                "<br>".join(conflict_lines),
+                unsafe_allow_html=True,
+            )
+
+            st.caption(
+                "기존 일정과 겹치거나 앞뒤 간격이 10분 미만이에요. "
+                "대체 시간을 선택하거나 원래 시간으로 등록할 수 있어요."
+            )
+
+            st.markdown("**대체 시간 추천**")
+
+            with st.expander("추천 기준 보기", expanded=False):
+                st.write(
+                    "업무 시간 09:00–18:00 · "
+                    "점심시간 12:00–13:00 제외 · "
+                    "일정 앞뒤 10분 여유"
+                )
+
+                st.caption(
+                    "선택 가능한 시간을 우선하고, 같은 날의 시간부터 "
+                    "원래 시작 시간과 가까운 순서로 표시해요."
+                )
+
+            if suggestions:
+                available_count = sum(
+                    bool(item["available"])
+                    for item in suggestions
+                )
+
+                if available_count == 0:
+                    st.info(
+                        "기존 추천 시간에도 충돌이 생겼어요. "
+                        "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                    )
+
+                # 한 줄에 최대 3개의 추천 표시
+                for row_start in range(0, len(suggestions), 3):
+                    row = suggestions[row_start:row_start + 3]
+                    cols = st.columns(len(row))
+
+                    for offset, item in enumerate(row):
+                        display_index = row_start + offset
+                        slot = item["slot"]
+                        available = item["available"]
+
+                        with cols[offset]:
+                            with st.container(border=True):
+                                if available and display_index == 0:
+                                    st.markdown("**⭐ 우선 추천**")
+                                else:
+                                    st.markdown(
+                                        f"**대체 시간 {display_index + 1}**"
+                                    )
+
+                                st.text(slot_text(slot))
+
+                                if available:
+                                    if item["same_day"]:
+                                        delta = item["difference_minutes"]
+
+                                        if delta == 0:
+                                            reason = (
+                                                "원래 시작 시간과 같아요."
+                                            )
+                                        else:
+                                            direction = (
+                                                "늦춘"
+                                                if delta > 0
+                                                else "앞당긴"
+                                            )
+
+                                            hours, minutes = divmod(
+                                                abs(delta), 60
+                                            )
+
+                                            duration_parts = []
+
+                                            if hours:
+                                                duration_parts.append(
+                                                    f"{hours}시간"
+                                                )
+
+                                            if minutes:
+                                                duration_parts.append(
+                                                    f"{minutes}분"
+                                                )
+
+                                            duration_text = " ".join(
+                                                duration_parts
+                                            )
+
+                                            reason = (
+                                                "원래 일정과 같은 날이에요. "
+                                                f"시작을 {duration_text} "
+                                                f"{direction} 시간이에요."
+                                            )
+                                    else:
+                                        reason = (
+                                            "다른 날짜에 확보할 수 있는 "
+                                            "대체 시간이에요."
+                                        )
+
+                                    st.caption(reason)
+                                    st.caption("✅ 현재 충돌 없음")
+
+                                else:
+                                    st.caption(
+                                        "⛔ 다른 일정과 충돌해 "
+                                        "선택할 수 없어요."
+                                    )
+
+                                st.button(
+                                    "이 시간으로 등록",
+                                    key=(
+                                        f"pe_s{item['original_index']}"
+                                    ),
+                                    on_click=_decide_cb,
+                                    args=(
+                                        str(
+                                            item["original_index"] + 1
+                                        ),
+                                    ),
+                                    use_container_width=True,
+                                    disabled=not available,
+                                    type=(
+                                        "primary"
+                                        if available and display_index == 0
+                                        else "secondary"
+                                    ),
+                                )
+
+            else:
+                st.info(
+                    "2주 안에서 조건에 맞는 업무 시간을 "
+                    "찾지 못했어요. "
+                    "취소 후 날짜나 시간을 바꿔 다시 시도해 주세요."
+                )
+
+        else:
+            st.success("✅ 일정 충돌이 해소됐어요.")
+            st.write(event_description)
+            st.caption("원래 시간으로 등록할 수 있어요.")
+
+        st.divider()
+
+        a, b = st.columns([2, 1])
+
+        a.button(
+            (
+                "충돌을 감수하고 원래 시간으로 등록"
+                if conflicts
+                else "원래 시간으로 등록"
+            ),
+            key="pe_orig",
+            on_click=_decide_cb,
+            args=("original",),
+            use_container_width=True,
+            type="secondary" if conflicts else "primary",
+        )
+
+        b.button(
+            "취소",
+            key="pe_cancel",
+            on_click=_decide_cb,
+            args=("cancel",),
+            use_container_width=True,
+        )
+
+
+# ─────────────────────────────────────────────
+# 퇴근 10분 전 내일 브리핑
+# 기존 "# 화면" 바로 위에 이 블록 전체 추가
+# ─────────────────────────────────────────────
+
+def render_leave_briefing_settings():
+    # 사이드바 ⚙️ 설정: 퇴근 브리핑 켜기·시간·미리보기·초기화 + 테스트 상태 (본문 첫 화면을 가리지 않게)
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    settings = st.session_state.data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+    now = briefing_dt.datetime.now(seoul)
+    current_iso = now.date().isoformat()
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+    try:
+        saved_time = briefing_dt.time.fromisoformat(settings["leave_briefing_time"])
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+    st.session_state.setdefault("lb_enabled_widget", settings["leave_briefing_enabled"])
+    st.session_state.setdefault("lb_time_widget", saved_time)
+
+    with st.expander("⚙️ 설정 · 퇴근 브리핑", expanded=False):
+        enabled = st.checkbox("퇴근 10분 전 내일 브리핑 받기", key="lb_enabled_widget")
+        leave_time = st.time_input("퇴근 시간 · 24시간 기준", key="lb_time_widget", step=60)
+        st.caption("오후 6시는 18:00이에요. 앱이 열려 있는 동안 30초마다 확인해요.")
+        left, right = st.columns(2)
+        preview_clicked = left.button("미리보기", key="lb_preview_button", use_container_width=True)
+        reset_clicked = right.button("초기화", key="lb_reset_button", use_container_width=True,
+                                     help="오늘 알림을 다시 받을 수 있게 해요")
+        show_test = st.toggle("🛠️ 테스트 상태 보기", key="lb_test_toggle")
+
+        leave_text = leave_time.strftime("%H:%M")
+        if (settings["leave_briefing_enabled"] != enabled or settings["leave_briefing_time"] != leave_text
+                or reset_clicked):
+            settings["leave_briefing_enabled"] = enabled
+            settings["leave_briefing_time"] = leave_text
+            settings["leave_briefing_ack_date"] = ""
+            st.session_state.pop("lb_toast_date", None)
+            save_data()
+        if preview_clicked:
+            st.session_state["lb_preview_date"] = current_iso
+
+        if show_test:
+            leave_at = briefing_dt.datetime.combine(now.date(), leave_time, tzinfo=seoul)
+            notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+            acknowledged = settings["leave_briefing_ack_date"] == current_iso
+            auto_show = enabled and now >= notification_at and not acknowledged
+            st.text(f"현재 한국 시간: {now:%Y-%m-%d %H:%M:%S}")
+            st.text(f"설정한 퇴근 시간: {leave_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 시작 시간: {notification_at:%Y-%m-%d %H:%M}")
+            st.text(f"알림 켜짐: {'예' if enabled else '아니요'}")
+            st.text(f"오늘 확인 완료: {'예' if acknowledged else '아니요'}")
+            st.text(f"자동 표시 조건 충족: {'예' if auto_show else '아니요'}")
+            if not enabled:
+                st.info("브리핑 받기를 켜주세요.")
+            elif acknowledged:
+                st.info("오늘 브리핑을 확인했어요. 다시 테스트하려면 '초기화'를 누르세요.")
+            elif now < notification_at:
+                minutes, seconds = divmod(int((notification_at - now).total_seconds()), 60)
+                st.info(f"알림 시작까지 {minutes}분 {seconds}초 남았어요.")
+            else:
+                st.success("자동 브리핑 표시 조건이 충족됐어요.")
+
+
+@st.fragment(run_every="30s")
+def render_leave_briefing():
+    import datetime as briefing_dt
+    from zoneinfo import ZoneInfo
+
+    app_data = st.session_state.data
+    settings = app_data.setdefault("settings", {})
+    seoul = ZoneInfo("Asia/Seoul")
+
+    now = briefing_dt.datetime.now(seoul)
+    current_date = now.date()
+    next_date = current_date + briefing_dt.timedelta(days=1)
+
+    current_iso = current_date.isoformat()
+    next_iso = next_date.isoformat()
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+
+    settings.setdefault("leave_briefing_enabled", True)
+    settings.setdefault("leave_briefing_time", "18:00")
+    settings.setdefault("leave_briefing_ack_date", "")
+
+    try:
+        saved_time = briefing_dt.time.fromisoformat(
+            settings["leave_briefing_time"]
+        )
+    except (TypeError, ValueError):
+        saved_time = briefing_dt.time(18, 0)
+
+    st.session_state.setdefault(
+        "lb_enabled_widget",
+        settings["leave_briefing_enabled"],
+    )
+    st.session_state.setdefault("lb_time_widget", saved_time)
+
+    # 설정 값은 사이드바 ⚙️ 설정(render_leave_briefing_settings)에서 바꾸고, 여기서는 읽기만 함
+    enabled = bool(settings["leave_briefing_enabled"])
+    leave_time = saved_time
+    leave_text = leave_time.strftime("%H:%M")
+    leave_at = briefing_dt.datetime.combine(current_date, leave_time, tzinfo=seoul)
+    notification_at = leave_at - briefing_dt.timedelta(minutes=10)
+    acknowledged = settings["leave_briefing_ack_date"] == current_iso
+    auto_show = enabled and now >= notification_at and not acknowledged
+    preview_show = st.session_state.get("lb_preview_date") == current_iso
+
+    if not (auto_show or preview_show):
+        return
+
+    if (
+        auto_show
+        and st.session_state.get("lb_toast_date") != current_iso
+    ):
+        st.toast(
+            "김 대리님, 퇴근 전 내일 일정을 확인하세요.",
+            icon="🌙",
+        )
+        st.session_state["lb_toast_date"] = current_iso
+
+    # 기존 일정 데이터 사용
+    next_events = sorted(
+        [
+            event
+            for event in app_data.get("events", [])
+            if event.get("date") == next_iso
+        ],
+        key=lambda event: event.get("start") or "00:00",
+    )
+
+    # 기존 할 일 데이터 사용: 마감일 due, 완료 여부 done
+    next_todos = sorted(
+        [
+            todo
+            for todo in app_data.get("todos", [])
+            if todo.get("due") == next_iso
+            and not todo.get("done", False)
+        ],
+        key=lambda todo: (
+            PRIORITY_ORDER.get(todo.get("priority", "보통"), 1),
+            todo.get("title", ""),
+        ),
+    )
+
+    # 기존 앱의 시간 겹침·간격 부족 판단 로직 사용
+    conflict_pairs = []
+
+    for index, first in enumerate(next_events):
+        first_span = event_span(first)
+        if first_span is None:
+            continue
+
+        for second in next_events[index + 1:]:
+            second_span = event_span(second)
+            if second_span is None:
+                continue
+
+            reason = conflict_reason(first_span, second_span)
+            if reason:
+                conflict_pairs.append((first, second, reason))
+
+    next_label = (
+        f"{next_date.month}/{next_date.day}"
+        f"({weekdays[next_date.weekday()]})"
+    )
+
+    with st.container(border=True):
+        st.subheader("🌙 김 대리님의 내일 브리핑")
+        st.caption(
+            f"내일 {next_label} · "
+            f"퇴근 시간 {leave_text} · 한국 시간 기준"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("내일 일정", f"{len(next_events)}건")
+        c2.metric("내일 마감", f"{len(next_todos)}건")
+        c3.metric("일정 충돌·간격 부족", f"{len(conflict_pairs)}건")
+
+        st.markdown("**📅 내일 일정**")
+
+        if next_events:
+            for event in next_events:
+                st.text(
+                    f"• {event_time_text(event)} | "
+                    f"{event.get('title', '제목 없음')}"
+                )
+
+                category = event.get("category", "")
+                if category:
+                    st.caption(f"분류: {category}")
+
+                note = event.get("note", "")
+                if note:
+                    with st.expander(
+                        f"📝 {event.get('title', '일정')} 메모"
+                    ):
+                        st.text(note)
+        else:
+            st.caption("내일 등록된 일정이 없어요.")
+
+        st.markdown("**⏰ 내일 마감인 미완료 업무**")
+
+        if next_todos:
+            for todo in next_todos:
+                priority = todo.get("priority", "보통")
+
+                st.text(
+                    f"• [{priority}] "
+                    f"{todo.get('title', '제목 없음')}"
+                )
+
+                detail = todo.get("detail", "")
+                if detail:
+                    with st.expander(
+                        f"📋 {todo.get('title', '업무')} 상세"
+                    ):
+                        st.text(detail)
+
+            st.caption(
+                "할 일에는 마감 날짜만 저장되어 있어요. "
+                "구체적인 마감 시간은 업무 상세 내용을 확인해 주세요."
+            )
+        else:
+            st.caption("내일 마감인 미완료 업무가 없어요.")
+
+        if conflict_pairs:
+            st.warning(
+                "내일 일정이 겹치거나 일정 사이 여유가 부족해요."
+            )
+
+            for first, second, reason in conflict_pairs:
+                st.text(
+                    f"• {first.get('title', '제목 없음')} "
+                    f"({event_time_text(first)})"
+                    f" ↔ {second.get('title', '제목 없음')} "
+                    f"({event_time_text(second)})"
+                    f" — {reason}"
+                )
+
+        if not next_events and not next_todos:
+            st.success(
+                "내일 등록된 일정과 마감 업무가 없어요. "
+                "편안하게 하루를 마무리하세요."
+            )
+
+        st.divider()
+
+        def acknowledge_briefing():
+            ack_date = (
+                briefing_dt.datetime.now(seoul).date().isoformat()
+            )
+
+            st.session_state.data["settings"][
+                "leave_briefing_ack_date"
+            ] = ack_date
+
+            st.session_state.pop("lb_preview_date", None)
+            save_data()
+
+        st.button(
+            "✅ 확인 완료 · 오늘 브리핑 닫기",
+            key="lb_ack_button",
+            on_click=acknowledge_briefing,
+            use_container_width=True,
+            type="primary",
+        )
+
+
+SIDE_MAIN = st.sidebar.container()          # 사이드바 위쪽: 새 채팅·대화 기록·요약
+SIDE_SETTINGS = st.sidebar.container()      # 사이드바 맨 아래: ⚙️ 설정
+with SIDE_SETTINGS:
+    render_leave_briefing_settings()
 
 # ─────────────────────────────────────────────
 # 화면
@@ -1584,10 +2653,13 @@ _ov = count_overlaps()
 if _ov:
     _chip_html += f'<span class="able-chip warn">충돌 일정 {_ov}건</span>'
 st.markdown(
-    f'<div class="able-hero"><div class="able-title">🤖 AI 개인비서 에이블</div>'
-    f'<div class="able-sub">김 대리님의 업무를 돕는 음성 AI 비서 · {today.year}년 {today.month}월 {today.day}일 '
-    f'{WEEKDAYS[today.weekday()]}요일</div>{_chip_html}</div>',
+    f'<div class="able-hero"><span class="able-mark big"></span>'
+    f'<div class="able-hero-text"><div class="able-title">AI 개인비서 에이블</div>'
+    f'<div class="able-sub">{today.month}월 {today.day}일 {WEEKDAYS[today.weekday()]}요일 · 김 대리님의 업무 비서</div></div>'
+    f'<div class="able-chips">{_chip_html}</div></div>',
     unsafe_allow_html=True)
+
+render_leave_briefing()      # 퇴근 10분 전(또는 미리보기)에만 헤더 아래에 내일 브리핑 카드가 나타남
 
 render_pending_event()
 render_pending_delete()
@@ -1602,11 +2674,7 @@ with tab_dash:
     overdue = [t for t in undone if (d := parse_date(t["due"])) and d < today]
     today_events = [e for e in data["events"] if parse_date(e["date"]) == today]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("오늘 일정", f"{len(today_events)}건")
-    c2.metric("남은 할 일", f"{len(undone)}건",
-              delta=f"기한 지남 {len(overdue)}건" if overdue else None, delta_color="inverse")
-    c3.metric("이번 주 마감", f"{len(due_this_week)}건")
+    st.markdown(dashboard_cards_html(undone, overdue, due_this_week, today_events), unsafe_allow_html=True)
 
     with st.expander("⚙️ 일정 종류 · 할 일 분류 직접 정하기"):
         render_type_settings()
@@ -1856,9 +2924,26 @@ TOOLS = [
         "strict": True,
     },
     {
+        "type": "function", "name": "delete_todo",
+        "description": "할 일을 삭제해 달라고 할 때 사용합니다(완료 처리와 다름). 바로 지우지 않고 삭제 대상을 찾아 화면에 보여 준 뒤 "
+                       "status=needs_approval과 candidates를 돌려줍니다. 김 대리가 승인해야 decide_pending_delete로 삭제됩니다.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string",
+                            "description": "할 일을 가리키는 말 그대로(예: '경쟁사 분석', '보고서'). "
+                                           "'완료한 할 일 다 지워줘'처럼 이름 없이 정리할 때만 빈 문자열"},
+                "status": {"type": "string", "enum": ["미완료", "완료", "전체"],
+                           "description": "어떤 할 일에서 찾을지. 보통 미완료, '완료한 할 일 지워줘'면 완료, 모르면 전체"},
+            },
+            "required": ["keyword", "status"], "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "type": "function", "name": "decide_pending_delete",
-        "description": "삭제 승인 대기 중인 일정을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
-                       "번호(1~5): 그 일정 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
+        "description": "삭제 승인 대기 중인 일정·할 일을 김 대리의 대답대로 처리합니다. 김 대리가 승인한 뒤에만 사용합니다. "
+                       "번호(1~5): 그 항목 삭제, all: 후보 전부 삭제, cancel: 삭제하지 않음.",
         "parameters": {
             "type": "object",
             "properties": {"choice": {"type": "string", "enum": ["1", "2", "3", "4", "5", "all", "cancel"]}},
@@ -1881,7 +2966,7 @@ TOOLS = [
 TOOL_LABEL = {"send_email": "메일", "add_todo": "할 일 추가", "add_event": "일정 추가",
               "move_event": "일정 변경", "complete_todo": "완료 처리", "decide_pending_event": "일정 승인",
               "confirm_pending_email": "메일 발송", "get_recent_mails": "받은 메일",
-              "delete_event": "일정 삭제", "decide_pending_delete": "삭제 승인"}
+              "delete_event": "일정 삭제", "delete_todo": "할 일 삭제", "decide_pending_delete": "삭제 승인"}
 
 
 def recent_mails_for_chat(count=5):
@@ -1918,6 +3003,8 @@ def run_tool(name, args):
         return decide_pending(args["choice"])
     if name == "delete_event":
         return request_delete(args["date"], args["keyword"].strip())
+    if name == "delete_todo":
+        return request_delete_todo(args["keyword"].strip(), args["status"])
     if name == "decide_pending_delete":
         return decide_pending_delete(args["choice"])
     if name == "get_recent_mails":
@@ -1931,13 +3018,13 @@ def action_of(name, args, result):
     label = TOOL_LABEL.get(name, name)
     if not isinstance(result, dict) or result.get("status") == "failed":
         return {"ok": False, "text": f"{label} 실패 ({(result or {}).get('error', '')})"}
-    if name == "delete_event":
-        return {"ok": True, "warn": True, "text": "🗑️ 삭제 승인 대기 → "
+    if name in ("delete_event", "delete_todo"):
+        return {"ok": True, "warn": True, "text": f"🗑️ {label} 승인 대기 → "
                 + ", ".join(f"{c['no']}. {c['title']} ({c['when']})" for c in result["candidates"])}
     if name == "decide_pending_delete":
         if result["decision"] == "취소":
-            return {"ok": True, "text": "🗑️ 일정 삭제를 취소했어요 (일정은 그대로 있어요)"}
-        return {"ok": True, "text": "🗑️ 일정 삭제 완료 → " + ", ".join(result["deleted"])}
+            return {"ok": True, "text": f"🗑️ {result['kind']} 삭제를 취소했어요 (그대로 있어요)"}
+        return {"ok": True, "text": f"🗑️ {result['kind']} 삭제 완료 → " + ", ".join(result["deleted"])}
     if result.get("status") == "needs_approval":
         return {"ok": True, "warn": True,
                 "text": f"일정 충돌 감지 → 승인 대기: {result['title']} ({result['requested']}) · "
@@ -1994,6 +3081,10 @@ def system_prompt():
         "  김 대리가 '응/지워줘/1번'이라고 하면 decide_pending_delete(번호, 후보가 하나면 1), '전부' → all,",
         "  '아니/하지 마/취소'라고 하면 cancel입니다. (삭제 승인 대기 중의 '취소'는 삭제를 그만두라는 뜻)",
         "  찾지 못했으면(failed) events_on_date를 알려 주고 어떤 일정인지 묻습니다. 삭제했다고 지어내지 않습니다.",
+        "- 할 일을 지워 달라고 하면(예: '경쟁사 분석 할 일 지워줘', '완료한 할 일 다 지워줘') delete_todo를 사용합니다.",
+        "  '다 했어/끝냈어'는 삭제가 아니라 complete_todo(완료 처리)입니다. 지워 달라고 할 때만 delete_todo를 씁니다.",
+        "  승인 방법은 일정 삭제와 같습니다: 후보를 보여 주고 묻고, 다음 대답에서 decide_pending_delete를 사용합니다.",
+        "  찾지 못했으면(failed) todos 목록을 알려 주고 어떤 할 일인지 묻습니다.",
         "- 이메일로 보내 달라는 명시적 요청이 있을 때만 send_email을 사용합니다.",
         "  받는 사람을 말하지 않으면 to에 '나'를 넣습니다. 연락처에 있는 사람은 이름으로 넣을 수 있고,",
         "  연락처에 없는 사람의 이메일 주소는 절대 지어내지 않습니다.",
@@ -2003,7 +3094,9 @@ def system_prompt():
         "- 메일을 보내 달라고 하면 메일을 쓰고 send_email까지 반드시 호출합니다. 보낼지 다시 묻지 않습니다.",
         "- send_email 결과가 success면 '메일을 보냈습니다'라고 받는 사람과 제목을 알려 줍니다.",
         "- needs_confirmation이면 아직 보내지 않은 것입니다. AI 확인에서 나온 확인할 점(issues)을 짧게 말하고",
-        "  '그래도 보낼까요?'라고 묻습니다. 김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send),",
+        "  '그래도 보낼까요?'라고 한 번만 묻습니다. 같은 답변 안에서 send_email을 다시 부르지 않습니다.",
+        "  김 대리가 '보내줘/그래도 보내'라고 하면 confirm_pending_email(send)로 바로 보냅니다(다시 확인하지 않음).",
+        "  내용을 고쳐 달라고 하면 고친 내용으로 send_email을 부르면 확인 없이 바로 발송됩니다.",
         "  '보내지 마/취소'라고 하면 confirm_pending_email(cancel)을 사용합니다.",
         "- failed면 이유를 알리고 필요한 정보를 묻습니다.",
         "- 도구를 사용한 뒤에는 무엇을 했는지 짧게 보고합니다.",
@@ -2021,8 +3114,9 @@ def system_prompt():
                   + ", ".join(f"{i + 1}) {slot_text(x)}" for i, x in enumerate(p["suggestions"])), ""]
     pd_evs = pending_delete_events()
     if pd_evs:
-        lines += ["[삭제 승인 대기 중인 일정] (아직 삭제하지 않음)"]
-        lines += [f"{i + 1}) {e['title']} ({e['date']} {event_time_text(e)})" for i, e in enumerate(pd_evs)] + [""]
+        kind = pending_delete_kind()
+        lines += [f"[삭제 승인 대기 중인 {KIND_NAME[kind]}] (아직 삭제하지 않음)"]
+        lines += [f"{i + 1}) {delete_item_text(kind, e)}" for i, e in enumerate(pd_evs)] + [""]
     note = latest_note()
     if note:
         lines += [f"[최근 회의] {note['title']} ({note['when']})", "요약:"]
@@ -2095,15 +3189,47 @@ def save_turn(chat, turn):
     return chat
 
 
-def prepare_email(args, question, via="text"):
-    # send_email 도구: 받는 사람 확인 → AI 점검 → 문제가 없으면 발송
-    #   음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+def pending_mail_of(chat):
+    # 이 대화에서 '보내기 전 확인'을 이미 마치고 김 대리 대답을 기다리는 메일
+    for t in reversed(chat["turns"] if chat else []):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            return t["mail"], t
+    return None, None
+
+
+def prepare_email(args, question, via="text", chat=None, reviewed=None):
+    # send_email 도구: 받는 사람 확인 → AI 점검(메일 한 통에 딱 한 번) → 발송
+    #   · 음성 요청은 AI 확인에서 문제가 없으면 바로 발송, 글 요청은 설정에 따라 김 대리 확인 후 발송
+    #   · 이미 한 번 확인한 메일(이번 답변 안에서 다시 호출 / 확인 대기 중에 '보내줘')은 다시 확인하지 않음
     rcpt, err = resolve_recipient(args["to"])
     if err:
         return {"status": "failed", "error": err}, None, {"ok": False, "text": f"📧 메일 준비 실패 ({err})"}
-    ctx = f"[김 대리 요청]\n{question}\n\n[참고 자료]\n{brief_context()}"
-    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     who = f"{rcpt['name']} <{rcpt['email']}>" if rcpt["name"] else rcpt["email"]
+
+    if reviewed is not None:
+        # 같은 답변 안에서 send_email을 또 부른 경우: 다시 확인하지 않고, 김 대리 대답을 기다리게 함
+        reviewed.update(to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        return ({"status": "needs_confirmation", "already_reviewed": True, "to": rcpt["email"],
+                 "message": "이 메일은 방금 확인을 마쳤습니다. 다시 확인하거나 send_email을 또 부르지 말고, "
+                            "확인할 점을 한 번만 말한 뒤 '그래도 보낼까요?'라고 물어보세요."}, None, None)
+
+    prior, prior_turn = pending_mail_of(chat)
+    if prior is not None and prior["to"].lower() == rcpt["email"].lower():
+        # 앞 답변에서 이미 확인을 마친 메일(같은 받는 사람): 김 대리가 보내라고 했으므로 다시 확인하지 않고 바로 발송
+        sr = send_email(rcpt["email"], args["subject"], args["body"])
+        if sr["status"] != "success":
+            return sr, None, {"ok": False, "text": f"📧 메일 발송 실패 ({sr['error']})"}
+        prior.update(status="sent", to=rcpt["email"], name=rcpt["name"], subject=args["subject"], body=args["body"])
+        save_data()
+        return ({"status": "success", "to": rcpt["email"], "subject": args["subject"],
+                 "note": "발송 전 확인은 앞에서 한 번 마쳤습니다."}, None,
+                {"ok": True, "text": f"📧 메일 발송 완료 → {who} · '{args['subject']}'"})
+
+    history = ""
+    if chat:
+        history = "\n".join(f"김 대리: {t['q']}\n에이블: {t['a'][:300]}" for t in chat["turns"][-4:])
+    ctx = (f"[김 대리 요청]\n{question}\n\n[이전 대화]\n{history or '(없음)'}\n\n[참고 자료]\n{brief_context()}")
+    rv = review_email(rcpt, args["subject"], args["body"], ctx)
     if rv["ok"] and (via == "voice" or not data["settings"].get("confirm_before_send", True)):
         sr = send_email(rcpt["email"], args["subject"], args["body"])
         if sr["status"] == "success":
@@ -2167,6 +3293,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
 
     client = get_client()
     actions, mail = [], None
+    sent_mail = None                     # 이번 답변에서 이미 보낸 메일 (같은 메일을 두 번 보내지 않게)
     asked_delete = False                 # 이번 답변에서 삭제 대상을 보여 줬으면 같은 답변에서는 삭제 금지
     for _ in range(5):  # 도구 호출은 최대 5회 반복
         resp = client.responses.create(model=MODEL, instructions=instructions, input=inputs, tools=TOOLS)
@@ -2176,9 +3303,20 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
         inputs += resp.output
         for c in calls:
             args = json.loads(c.arguments)
+            if c.name == "send_email" and sent_mail:
+                inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                               "output": json.dumps({"status": "success", "already_sent": True, **sent_mail},
+                                                    ensure_ascii=False)})
+                continue
             if c.name == "send_email":
-                result, new_mail, act = prepare_email(args, question, via)
+                result, new_mail, act = prepare_email(args, question, via, chat, mail)
                 mail = new_mail or mail
+                if result.get("status") == "success":
+                    sent_mail = {"to": result["to"], "subject": args["subject"]}
+                if act is None:                  # 이미 확인한 메일을 다시 부른 경우: 화면에 확인 알림을 또 띄우지 않음
+                    inputs.append({"type": "function_call_output", "call_id": c.call_id,
+                                   "output": json.dumps(result, ensure_ascii=False)})
+                    continue
             elif c.name == "confirm_pending_email":
                 result, act = confirm_pending_mail(chat, args["action"], mail)
             elif c.name == "decide_pending_delete" and asked_delete and args["choice"] != "cancel":
@@ -2189,7 +3327,7 @@ def ask_assistant(chat, question, file_name="", file_text="", via="text"):
             else:
                 result = run_tool(c.name, args)
                 act = action_of(c.name, args, result)
-                if c.name == "delete_event" and result.get("status") == "needs_approval":
+                if c.name in ("delete_event", "delete_todo") and result.get("status") == "needs_approval":
                     asked_delete = True
             if not (isinstance(result, dict) and result.get("retry")):
                 actions.append(act)
@@ -2242,51 +3380,31 @@ with tab_chat:
     n = st.session_state.chat_n
     chat = current_chat()
     turns = chat["turns"] if chat else []
-    autoplay_id = st.session_state.pop("chat_autoplay", None)
 
-    h1, h2, h3 = st.columns([5, 1.3, 1.3])
+    h1, h3 = st.columns([6, 1.3])
     h1.markdown(f"#### 💬 {chat['title'] if chat else '새 채팅'}")
-    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 대화 기록은 왼쪽 사이드바에 있어요")
-    h2.button("➕ 새 채팅", key="new_chat_main", on_click=new_chat_cb, use_container_width=True)
+    h1.caption(f"🧠 이 대화에서 기억 중인 질문·답변 {len(turns)}/{MAX_TURNS} · 새 채팅과 대화 기록은 왼쪽 사이드바에 있어요")
     h3.download_button("⬇️ 대화 저장", history_text(chat) if chat else "", file_name="에이블_대화기록.txt",
                        mime="text/plain", use_container_width=True, disabled=not turns)
 
-    voice_in = None
-    has_mic = hasattr(st, "audio_input")
+    voice_val = None
     if not turns:
-        # 새 채팅: 바로 말로 요청할 수 있게 녹음기를 맨 위에 크게
+        # 새 채팅: 에이블 로고를 크게 → 누르면 녹음, 다시 누르면 전달
         with st.container(border=True):
-            st.markdown("### 🎙️ 말로 요청해 보세요")
-            st.caption("마이크 버튼을 눌러 말하고 다시 누르면 바로 에이블에게 전달돼요. "
-                       "예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘")
-            if has_mic:
-                voice_in = st.audio_input("음성으로 요청하기", key=f"chat_mic_{n}", label_visibility="collapsed")
-                st.caption("녹음기에 'An error has occurred'가 뜨면 페이지를 새로고침한 뒤 다시 녹음하거나, 아래에 글로 입력해 주세요.")
-            else:
-                st.warning("실시간 녹음을 쓰려면 `!pip install -q -U streamlit`으로 업데이트하세요.")
+            st.markdown("<h3 style='text-align:center; margin-bottom:0'>🎙️ 에이블에게 말로 요청해 보세요</h3>",
+                        unsafe_allow_html=True)
+            voice_val = able_mic("big", "able_mic_big")
+            st.caption("예) 내일 오후 2시에 고객사 미팅 잡아줘 · 최근 회의 요약해서 박과장님께 메일 보내줘 · "
+                       "마이크 권한을 물으면 '허용'을 눌러 주세요.")
 
-    for t in turns:
-        with st.chat_message("user", avatar="🧑‍💼"):
-            if t["via"] == "voice":
-                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
-            st.markdown(t["q"])
-            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
-        with st.chat_message("assistant", avatar="🤖"):
-            st.markdown(t["a"])
-            for a in t["actions"]:
-                show_action(a)
-            audio = st.session_state.audio_cache.get(t["id"])
-            if audio:
-                st.audio(audio, format="audio/mp3", autoplay=(t["id"] == autoplay_id))
-
-    for t in turns:
-        if t.get("mail") and t["mail"]["status"] == "pending":
-            render_mail_confirm(t)
-
-    # --- 입력 카드 ---
+    # --- 입력 카드 (맨 위: 말로 지시해도 최근 대화를 바로 볼 수 있게) ---
     with st.container(border=True):
-        if turns and has_mic:
-            voice_in = st.audio_input("🎙️ 말로 이어서 요청하기", key=f"chat_mic_{n}")
+        err = st.session_state.pop("chat_error", None)
+        if err:
+            st.error(f"답변을 만들지 못했습니다: {err}")
+        if turns:
+            st.markdown("**🎙️ 말로 이어서 요청하기**")
+            voice_val = able_mic("compact", "able_mic_compact")
         typed = st.text_input("⌨️ 글로 입력", key=f"chat_text_{n}",
                               placeholder="예) 박과장님께 회의 요약 메일 보내줘 / 금요일 오후 3시 온라인 회의 잡아줘")
         up_txt = st.file_uploader("📎 텍스트 파일 첨부 (회의록, 메모 등)", type=["txt", "md", "csv"], key="chat_file")
@@ -2300,18 +3418,24 @@ with tab_chat:
         for col, qa in zip(qc, QUICK_ASKS):
             col.button(qa, key=f"quick_{qa}", on_click=set_quick, args=(qa,), use_container_width=True)
 
-        b1, b2, b3, b4 = st.columns([1.1, 1.5, 1.6, 1.4])
+        b1, b3, b4 = st.columns([1.1, 1.6, 1.4])
         run_clicked = b1.button("▶ 실행", type="primary", use_container_width=True)
-        auto_voice = b2.toggle("녹음 끝나면 바로 요청", value=True, key="chat_auto")
         tts_on = b3.toggle("🔊 답변 음성 재생", value=True, key="chat_tts")
         voice = b4.selectbox("목소리", list(VOICES), format_func=lambda v: f"{VOICES[v]} ({v})",
                              key="chat_voice", label_visibility="collapsed")
 
     quick = st.session_state.pop("chat_quick", None)
-    voice_bytes = voice_in.getvalue() if voice_in is not None else None
-    voice_hash = hashlib.md5(voice_bytes).hexdigest() if voice_bytes else None
-    new_voice = bool(voice_hash) and voice_hash != st.session_state.get("voice_done")
-    if run_clicked or quick or (auto_voice and new_voice):
+    # 로고 녹음기에서 온 새 녹음 (같은 녹음을 두 번 보내지 않게 id로 확인)
+    voice_bytes, voice_name, voice_hash = None, "voice.webm", None
+    if isinstance(voice_val, dict) and voice_val.get("b64") and voice_val.get("id") != st.session_state.get("voice_done"):
+        try:
+            voice_bytes = base64.b64decode(voice_val["b64"])
+            voice_name = "voice." + str(voice_val.get("ext") or "webm")
+            voice_hash = voice_val["id"]
+        except Exception:
+            voice_bytes = None
+    new_voice = voice_bytes is not None
+    if run_clicked or quick or new_voice:
         question = quick.split(" ", 1)[1] if quick else typed.strip()
         if not quick and not voice_bytes and not question:
             st.warning("음성을 녹음하거나 질문을 입력한 뒤 실행을 눌러 주세요.")
@@ -2323,7 +3447,7 @@ with tab_chat:
                 with st.spinner("답변을 준비하고 있습니다.."):
                     stt = None
                     if voice_bytes and not quick:
-                        stt = speech_to_text(voice_bytes)                            # 음성 → 텍스트 (STT)
+                        stt = speech_to_text(voice_bytes, voice_name, stt_hint(), STT_CHAT_MODELS)  # 음성 → 텍스트 (STT)
                         question = (stt + " " + question).strip()
                     answer, actions, mail = ask_assistant(chat, question, file_name, file_text,
                                                           "voice" if stt else "text")   # LLM 호출
@@ -2336,28 +3460,71 @@ with tab_chat:
                     cache[turn["id"]] = reply_audio
                     for k in list(cache)[:-30]:
                         del cache[k]
-                st.session_state.chat_autoplay = turn["id"]                       # 답변 음성 즉시 재생
+                if reply_audio:                                                   # 로고 녹음기가 '말하는 중'으로 재생
+                    st.session_state.mic_play = {"id": turn["id"], "ts": time.time(),
+                                                 "b64": base64.b64encode(reply_audio).decode()}
                 st.session_state.chat_n += 1                                      # 녹음기·입력칸 비우기
                 done = True
             except Exception as e:
-                st.error(f"답변을 만들지 못했습니다: {e}")
+                st.session_state.chat_error = str(e)        # 새로고침 후에도 보이게 저장 (로고도 '생각 중'에서 풀림)
+                done = True
             if done:
                 st.rerun()   # try 밖에서 호출해야 화면 새로고침 신호가 막히지 않음
+
+    # --- 보내기 전 확인 메일 (기다리는 메일이 있으면 대화 기록보다 먼저) ---
+    for t in reversed(turns):
+        if t.get("mail") and t["mail"]["status"] == "pending":
+            render_mail_confirm(t)
+
+    # --- 대화 기록: 최근 대화가 맨 위, 아래로 갈수록 이전 대화 ---
+    def render_turn(t):
+        with st.chat_message("user", avatar="🧑‍💼"):
+            if t["via"] == "voice":
+                st.caption("🎙️ 음성 인식 결과 (STT) — 말씀하신 내용이 맞는지 확인하세요")
+            st.markdown(t["q"])
+            st.caption(t["time"] + (f" · 첨부 {t['file']}" if t["file"] else ""))
+        with st.chat_message("assistant", avatar="🤖"):
+            st.markdown(t["a"])
+            for a in t["actions"]:
+                show_action(a)
+            audio = st.session_state.audio_cache.get(t["id"])
+            if audio:
+                st.audio(audio, format="audio/mp3")          # 처음 재생은 로고 녹음기가 '말하는 중'으로 해 줌
+
+    if turns:
+        latest, older = turns[-1], list(reversed(turns[:-1]))
+        with st.container(border=True):
+            st.markdown("**🆕 최근 대화**")
+            render_turn(latest)
+        if older:
+            st.markdown(f"**🕘 이전 대화 ({len(older)}개)** · 최근 순")
+            for t in older:
+                render_turn(t)
 
 
 # ─────────────────────────────────────────────
 # 🎙️ 회의 분석 (실시간 녹음 · 음성 파일 · 텍스트 파일)
 # ─────────────────────────────────────────────
+SCHEDULE_KINDS = ["회의·미팅", "회사 행사", "다른 사람 마감", "기타"]
 SCHEDULE_ITEM = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
+        "title": {"type": "string", "description": "일정 이름 (예: B사 제휴 미팅, 중간 점검 회의, 연말 프로모션)"},
+        "kind": {"type": "string", "enum": SCHEDULE_KINDS,
+                 "description": "회의·미팅: 회의·미팅·상담·방문·면담 / 회사 행사: 프로모션·출시·행사 기간 / "
+                                "다른 사람 마감: 김 대리가 아닌 사람의 업무 마감 / 기타"},
         "when_text": {"type": "string", "description": "시점 표현 원문 그대로"},
         "date_type": {"type": "string", "enum": ["exact", "approximate", "none"]},
-        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD, 아니면 빈 문자열"},
+        "date": {"type": "string", "description": "exact일 때만 YYYY-MM-DD(기간이면 시작일), 아니면 빈 문자열"},
+        "end_date": {"type": "string", "description": "기간 일정의 마지막 날 YYYY-MM-DD, 하루짜리면 빈 문자열"},
+        "start": {"type": "string", "description": "시작 시간 HH:MM(24시간), 언급 없으면 빈 문자열"},
+        "end": {"type": "string", "description": "끝나는 시간 HH:MM, 언급 없으면 빈 문자열"},
+        "place": {"type": "string", "description": "장소, 언급 없으면 빈 문자열"},
+        "kim_attends": {"type": "boolean", "description": "김 대리가 참석자로 언급되었으면 true"},
         "evidence": {"type": "string", "description": "원문에서 그대로 복사한 근거 문장 1개"},
     },
-    "required": ["title", "when_text", "date_type", "date", "evidence"],
+    "required": ["title", "kind", "when_text", "date_type", "date", "end_date", "start", "end", "place",
+                 "kim_attends", "evidence"],
     "additionalProperties": False,
 }
 
@@ -2369,7 +3536,7 @@ MEETING_SCHEMA = {
         "decisions": {"type": "array", "items": {"type": "string"}, "description": "회의에서 확정된 사항"},
         "kim_tasks": {"type": "array", "items": TASK_ITEM},
         "schedules": {"type": "array", "items": SCHEDULE_ITEM,
-                      "description": "김 대리 업무가 아닌, 회의에서 언급된 일정(출시, 광고 시작, 다음 회의 등)"},
+                      "description": "회의에서 언급된 일정(회의·미팅, 프로모션·출시 기간, 다른 사람 마감 등)"},
     },
     "required": ["title_guess", "summary", "decisions", "kim_tasks", "schedules"],
     "additionalProperties": False,
@@ -2386,7 +3553,13 @@ def analyze_meeting(text, title="", attendees=""):
         "[작성 규칙]",
         *TASK_RULES,
         "- summary: 안건별 핵심을 3~6개 문장으로. decisions: 회의에서 확정된 사항만.",
-        "- schedules: 김 대리 업무가 아닌 일정만. when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게.",
+        "- kim_tasks에는 김 대리가 해야 할 '작업'(문서·보고서 작성, 자료 준비, 조사, 메일 확인 등)만 넣습니다.",
+        "  회의·미팅·상담 '참석'은 kim_tasks가 아니라 schedules에 넣습니다.",
+        "- schedules: 회의에서 언급된 일정. 회의·미팅·상담·방문은 kind='회의·미팅', 프로모션·출시·행사 기간은 '회사 행사',",
+        "  김 대리가 아닌 사람의 업무 마감은 '다른 사람 마감'. 김 대리 업무의 마감은 kim_tasks에 있으므로 넣지 않습니다.",
+        "  when_text는 원문 표현, date_type/date는 위 기한 규칙과 같게. 기간이면 date=시작일, end_date=마지막 날.",
+        "  start/end는 원문에 시간이 있을 때만 HH:MM. kim_attends는 김 대리가 참석자로 언급됐을 때만 true.",
+        "  이미 잡혀 있는 기존 일정이 언급되어도(예: 김 대리 캘린더에 있는 상담) 그대로 schedules에 넣습니다.",
     ])
     resp = get_client().responses.create(
         model=MODEL, instructions=instructions,
@@ -2412,15 +3585,16 @@ def note_markdown(n):
             lines.append(f"  - {t['detail']}")
     if not n["kim_tasks"]:
         lines.append("- (없음)")
-    lines += ["", "## 회의에서 언급된 일정 (참고)"]
+    lines += ["", "## 회의에서 언급된 일정"]
     lines += [f"- {s['title']}: {s['when_text'] or '시점 언급 없음'}" for s in n["schedules"]] or ["- (없음)"]
     return "\n".join(lines)
 
 
 with tab_meet:
-    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고 **김 대리 업무만** 할 일에 올립니다.")
-    st.caption("📅 정확한 날짜가 있는 김 대리 업무만 캘린더에 들어갑니다. 대략적인 기한이나 다른 일정은 이 화면에서만 보여 드려요. "
-               "원문에서 근거를 찾지 못한 내용은 추가하지 않습니다.")
+    st.markdown("회의를 녹음하거나 녹음·텍스트 파일을 올리면 에이블이 요약하고, 분석이 끝나면 **자동으로** "
+                "문서 작성·보고서 제출 같은 **김 대리 업무는 할 일**로, **회의·미팅은 캘린더 일정**으로 등록합니다.")
+    st.caption("📅 정확한 날짜가 있는 할 일은 마감일로 캘린더에 표시되고, 김 대리가 참석하는 회의·미팅과 회사 행사(프로모션 기간 등)는 "
+               "일정으로 들어갑니다. 다른 사람의 마감, 날짜가 정확하지 않은 일정, 원문에서 근거를 찾지 못한 내용은 참고로만 보여 드려요.")
 
     with st.container(border=True):
         mode = st.radio("분석 방법", ["🎙️ 실시간 녹음", "📁 음성 파일 분석", "📄 텍스트 파일 분석"],
@@ -2471,12 +3645,14 @@ with tab_meet:
                     text = src_text
                 st.write("② 회의 내용 분석 중")
                 res = analyze_meeting(text, m_title, m_people)
-                st.write("③ 김 대리 업무를 할 일·캘린더에 반영 중")
-                tasks = apply_kim_tasks(res["kim_tasks"], text, "회의 분석")
-                schedules = [dict(s, verified=found_in(s["evidence"], text)) for s in res["schedules"]]
+                st.write("③ 할 일(문서·보고서 등)은 대시보드에, 회의·미팅은 캘린더 일정으로 반영 중")
+                note_title = m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의"
+                work, meet_like = split_meeting_tasks(res["kim_tasks"])
+                tasks = apply_kim_tasks(work, text, "회의 분석")
+                schedules = apply_meeting_schedules(res["schedules"] + meet_like, text, note_title)
                 note = {
                     "id": uuid.uuid4().hex[:8],
-                    "title": m_title.strip() or res["title_guess"].strip() or f"{today.isoformat()} 회의",
+                    "title": note_title,
                     "when": now_kst(), "attendees": m_people.strip(),
                     "source": ("실시간 녹음" if mode.startswith("🎙") else "음성 파일") if src_audio else "텍스트 파일",
                     "text": text, "summary": res["summary"], "decisions": res["decisions"],
@@ -2487,6 +3663,8 @@ with tab_meet:
                 save_data()
                 n_cal = sum(t["status"] == "calendar" for t in tasks)
                 n_add = sum(t["status"] in ("calendar", "approximate", "nodue") for t in tasks)
+                n_ev = sum(s["cal_status"] in ("calendar", "conflict") for s in schedules)
+                n_cf = sum(s["cal_status"] == "conflict" for s in schedules)
                 status.update(label="분석 완료!", state="complete")
                 done = True
             except Exception as e:
@@ -2494,7 +3672,8 @@ with tab_meet:
                 st.error(f"오류 내용: {e}")
         if done:
             st.session_state.meet_view = note["id"]
-            st.session_state.pending_toast = f"김 대리 업무 {n_add}건을 할 일에 추가했어요 (캘린더 {n_cal}건)."
+            st.session_state.pending_toast = (f"할 일 {n_add}건(마감 표시 {n_cal}건)과 일정 {n_ev}건을 캘린더에 추가했어요."
+                                              + (f" ⚠️ 겹치는 일정 {n_cf}건은 회의록에서 확인하세요." if n_cf else ""))
             st.rerun()
 
     notes = data["meeting_notes"]
@@ -2534,14 +3713,22 @@ with tab_meet:
             st.markdown("\n".join(f"- {s}" for s in n["decisions"]) or "_(확정된 사항이 없습니다)_")
         with r:
             st.markdown("#### 🗓️ 회의에서 언급된 일정")
-            st.caption("참고용입니다. 캘린더에는 넣지 않았어요.")
             if not n["schedules"]:
                 st.caption("언급된 일정이 없습니다.")
-            for s in n["schedules"]:
+            order = {"conflict": 0, "calendar": 1, "duplicate": 2, "reference": 3, "unverified": 4}
+            for s in sorted(n["schedules"], key=lambda x: (order.get(x.get("cal_status"), 3), x["date"] or "9999")):
                 when = s["when_text"] or "시점 언급 없음"
                 if s["date_type"] == "exact" and parse_date(s["date"]):
-                    when += f" ({fmt_date(parse_date(s['date']))})"
-                st.markdown(f"- **{s['title']}** · {when}" + ("" if s.get("verified", True) else " ⚠️근거 확인 필요"))
+                    when = fmt_date(parse_date(s["date"]))
+                    if parse_date(s.get("end_date")):
+                        when += f" ~ {fmt_date(parse_date(s['end_date']))}"
+                    if s.get("start"):
+                        when += f" {s['start']}" + (f"–{s['end']}" if s.get("end") else "")
+                st.markdown(f"**{s['title']}** · {when}" + (f" · {s['place']}" if s.get("place") else "")
+                            + f"  \n:gray[{s.get('kind', '기타')}]")
+                line = schedule_status_line(s)
+                {"calendar": st.success, "conflict": st.warning, "unverified": st.warning}.get(
+                    s.get("cal_status"), st.caption)(line)
 
         st.markdown(f"#### 🙋 김 대리 업무 ({len(n['kim_tasks'])}건)")
         if not n["kim_tasks"]:
@@ -2594,34 +3781,39 @@ with tab_meet:
         if st.session_state.get("meeting_delete_pending") == n["id"]:
             linked_ids = {t.get("todo_id") for t in n["kim_tasks"] if t.get("todo_id")}
             linked_count = sum(t["id"] in linked_ids for t in data["todos"])
+            linked_ev = {i for s in n["schedules"] if s.get("cal_status") in ("calendar", "conflict")
+                         for i in s.get("event_ids", [])}
+            linked_ev_count = sum(e["id"] in linked_ev for e in data["events"])
             with st.container(border=True):
                 st.markdown("#### 🗑️ 삭제할 범위를 선택해 주세요")
                 scope = st.radio(
                     "삭제 범위",
-                    ["회의록만 삭제", "회의록과 연결된 할 일도 삭제"],
+                    ["회의록만 삭제", "회의록과 연결된 할 일·일정도 삭제"],
                     index=0,
                     key=f"meeting_delete_scope_{n['id']}",
                 )
                 if scope == "회의록만 삭제":
                     st.info("회의 원문과 요약을 삭제합니다. 연결된 할 일과 캘린더 마감 표시는 유지됩니다.")
                 else:
-                    st.warning(f"회의록과 연결된 할 일 {linked_count}건을 함께 삭제합니다. "
-                               "해당 할 일의 캘린더 마감 표시도 사라집니다. 별도로 등록한 일정은 유지됩니다.")
+                    st.warning(f"회의록과 연결된 할 일 {linked_count}건, 이 회의 분석으로 추가한 일정 {linked_ev_count}건을 "
+                               "함께 삭제합니다. 원래 캘린더에 있던 일정과 직접 등록한 일정은 유지됩니다.")
                 cancel_col, confirm_col = st.columns(2)
                 if cancel_col.button("취소", key=f"meeting_delete_cancel_{n['id']}", use_container_width=True):
                     st.session_state.pop("meeting_delete_pending", None)
                     st.rerun()
                 if confirm_col.button("선택한 항목 삭제", key=f"meeting_delete_confirm_{n['id']}",
                                       type="primary", use_container_width=True):
-                    delete_tasks = scope == "회의록과 연결된 할 일도 삭제"
+                    delete_tasks = scope == "회의록과 연결된 할 일·일정도 삭제"
                     if delete_tasks:
                         data["todos"] = [t for t in data["todos"] if t["id"] not in linked_ids]
+                        data["events"] = [e for e in data["events"]
+                                          if not (e["id"] in linked_ev and e.get("source") == "회의 분석")]
                     data["meeting_notes"] = [item for item in data["meeting_notes"] if item["id"] != n["id"]]
                     save_data()
                     st.session_state.pop("meeting_delete_pending", None)
                     st.session_state.pop("meet_view", None)
                     st.session_state.pending_toast = (
-                        f"회의록과 연결된 할 일 {linked_count}건을 삭제했어요."
+                        f"회의록과 연결된 할 일 {linked_count}건, 일정 {linked_ev_count}건을 삭제했어요."
                         if delete_tasks else "회의록만 삭제했어요. 할 일과 캘린더 마감 표시는 유지했어요."
                     )
                     st.rerun()
@@ -3180,12 +4372,13 @@ with tab_mail:
 # ─────────────────────────────────────────────
 # 사이드바 (챕터를 누르면 펼쳐짐)
 # ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## 🤖 에이블")
-    st.caption("김 대리님의 AI 개인비서")
+with SIDE_MAIN:
+    st.markdown(f'<div class="able-side-brand"><span class="able-mark"></span><div><b>에이블</b>'
+                f'<div class="able-meta">김 대리님의 AI 개인비서</div></div></div>', unsafe_allow_html=True)
 
     # 0) GPT처럼 새 채팅 + 대화 기록
-    st.button("➕ 새 채팅", key="new_chat_side", on_click=new_chat_cb, type="primary", use_container_width=True)
+    st.button("새 채팅", key="new_chat_side", icon=":material/add:", on_click=new_chat_cb, type="primary",
+              use_container_width=True)
     chats = sorted(data["chats"], key=lambda c: c["updated"], reverse=True)
     with st.expander(f"💬 대화 기록 ({len(chats)}/{MAX_CHATS})", expanded=True):
         if not chats:
