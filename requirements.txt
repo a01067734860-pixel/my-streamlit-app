@@ -1,6 +1,2 @@
 streamlit>=1.40,<2
-langchain-core>=1,<2
-langchain-openai>=1,<2
-langchain-chroma>=1,<2
-langchain-text-splitters>=1,<2
-pypdf>=5,<7
+openai>=1.68
